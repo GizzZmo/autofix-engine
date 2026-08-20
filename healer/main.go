@@ -34,7 +34,7 @@ type Config struct {
 }
 
 func loadConfig() Config {
-	_ = godotenv.Load() // optional .env
+	_ = godotenv.Load()
 
 	return Config{
 		CFAccountID:     os.Getenv("CF_ACCOUNT_ID"),
@@ -54,20 +54,20 @@ func envOr(key, fallback string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Link record (shared schema with the Edge Worker)
+// Link record
 // ---------------------------------------------------------------------------
 
 type LinkRecord struct {
-	Status       string `json:"status"` // PENDING | HEALED | DEAD | HEALTHY
+	Status       string `json:"status"`
 	OriginalURL  string `json:"original_url"`
 	ResolvedURL  string `json:"resolved_url,omitempty"`
 	DiscoveredAt string `json:"discovered_at,omitempty"`
 	HealedAt     string `json:"healed_at,omitempty"`
-	Reason       string `json:"reason,omitempty"` // e.g. http_404, soft_404
+	Reason       string `json:"reason,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
-// In-memory + channel based discovery queue
+// Discovery queue
 // ---------------------------------------------------------------------------
 
 type DiscoveryQueue struct {
@@ -100,7 +100,7 @@ func (q *DiscoveryQueue) Enqueue(url string) {
 func (q *DiscoveryQueue) Chan() <-chan string { return q.ch }
 
 // ---------------------------------------------------------------------------
-// Wayback Machine
+// Wayback Machine (protected by circuit breaker)
 // ---------------------------------------------------------------------------
 
 type ArchiveResponse struct {
@@ -112,28 +112,46 @@ type ArchiveResponse struct {
 	} `json:"archived_snapshots"`
 }
 
+var waybackBreaker = NewCircuitBreaker(5, 60*time.Second, 1)
+
 func CheckArchive(client *http.Client, url string) (string, error) {
-	apiURL := fmt.Sprintf("https://archive.org/wayback/available?url=%s", url)
-	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	var result string
+	err := waybackBreaker.Execute(func() error {
+		apiURL := fmt.Sprintf("https://archive.org/wayback/available?url=%s", url)
+		req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", "AutoFix-Healer/1.0")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 500 {
+			return fmt.Errorf("wayback http %d", resp.StatusCode)
+		}
+
+		var res ArchiveResponse
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			return err
+		}
+		if res.ArchivedSnapshots.Closest.Available && res.ArchivedSnapshots.Closest.URL != "" {
+			result = res.ArchivedSnapshots.Closest.URL
+			return nil
+		}
+		// "no archive" is not a dependency failure — do not trip the breaker
+		return nil
+	})
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "AutoFix-Healer/1.0")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
+	if result == "" {
+		return "", fmt.Errorf("no archive found")
 	}
-	defer resp.Body.Close()
-
-	var res ArchiveResponse
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return "", err
-	}
-	if res.ArchivedSnapshots.Closest.Available && res.ArchivedSnapshots.Closest.URL != "" {
-		return res.ArchivedSnapshots.Closest.URL, nil
-	}
-	return "", fmt.Errorf("no archive found")
+	return result, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +168,6 @@ func looksLikeSoft404(body []byte, contentType string) bool {
 		return false
 	}
 	text := string(body)
-	// Extract <title> if present
 	if start := strings.Index(strings.ToLower(text), "<title"); start >= 0 {
 		if gt := strings.Index(text[start:], ">"); gt >= 0 {
 			end := strings.Index(strings.ToLower(text[start+gt:]), "</title>")
@@ -162,7 +179,6 @@ func looksLikeSoft404(body []byte, contentType string) bool {
 			}
 		}
 	}
-	// Body snippet (first ~8KB is enough)
 	snippet := text
 	if len(snippet) > 8192 {
 		snippet = snippet[:8192]
@@ -170,13 +186,7 @@ func looksLikeSoft404(body []byte, contentType string) bool {
 	return soft404BodyRe.MatchString(snippet)
 }
 
-// ---------------------------------------------------------------------------
-// Link health check (HEAD + GET + soft-404)
-// ---------------------------------------------------------------------------
-
-// CheckLink returns (isDead, reason).
 func CheckLink(client *http.Client, url string) (bool, string) {
-	// Primary: HEAD
 	req, err := http.NewRequest(http.MethodHead, url, nil)
 	if err != nil {
 		return true, "invalid_url"
@@ -193,7 +203,6 @@ func CheckLink(client *http.Client, url string) (bool, string) {
 		return true, fmt.Sprintf("http_%d", resp.StatusCode)
 	}
 
-	// Secondary: small GET for soft-404 inspection (and servers that reject HEAD)
 	req2, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return false, ""
@@ -203,7 +212,6 @@ func CheckLink(client *http.Client, url string) (bool, string) {
 
 	resp2, err := client.Do(req2)
 	if err != nil {
-		// HEAD succeeded; treat as healthy
 		return false, ""
 	}
 	defer resp2.Body.Close()
@@ -213,8 +221,7 @@ func CheckLink(client *http.Client, url string) (bool, string) {
 	}
 
 	body, _ := io.ReadAll(io.LimitReader(resp2.Body, 8192))
-	ct := resp2.Header.Get("Content-Type")
-	if looksLikeSoft404(body, ct) {
+	if looksLikeSoft404(body, resp2.Header.Get("Content-Type")) {
 		return true, "soft_404"
 	}
 	return false, ""
@@ -233,7 +240,7 @@ type CloudflareKV struct {
 
 func (c *CloudflareKV) Put(key string, record LinkRecord) error {
 	if c.AccountID == "" || c.NamespaceID == "" || c.Token == "" {
-		return fmt.Errorf("Cloudflare credentials not configured (CF_ACCOUNT_ID / CF_API_TOKEN / CF_KV_NAMESPACE_ID)")
+		return fmt.Errorf("Cloudflare credentials not configured")
 	}
 
 	body, err := json.Marshal(record)
@@ -271,7 +278,7 @@ func keyFor(url string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Worker that processes the queue
+// Worker
 // ---------------------------------------------------------------------------
 
 func runWorker(id int, q *DiscoveryQueue, kv *CloudflareKV, client *http.Client, wg *sync.WaitGroup) {
@@ -293,6 +300,16 @@ func runWorker(id int, q *DiscoveryQueue, kv *CloudflareKV, client *http.Client,
 		log.Printf("[worker-%d] dead (%s) — searching archive for %s", id, reason, url)
 		healed, err := CheckArchive(client, url)
 		if err != nil {
+			if err == ErrCircuitOpen {
+				log.Printf("[worker-%d] wayback circuit open — deferring %s", id, url)
+				_ = kv.Put(keyFor(url), LinkRecord{
+					Status:      "PENDING",
+					OriginalURL: url,
+					HealedAt:    time.Now().UTC().Format(time.RFC3339),
+					Reason:      "circuit_open",
+				})
+				continue
+			}
 			log.Printf("[worker-%d] no archive: %v", id, err)
 			_ = kv.Put(keyFor(url), LinkRecord{
 				Status:      "DEAD",
@@ -318,20 +335,23 @@ func runWorker(id int, q *DiscoveryQueue, kv *CloudflareKV, client *http.Client,
 }
 
 // ---------------------------------------------------------------------------
-// HTTP discovery API
+// HTTP API
 // ---------------------------------------------------------------------------
 
 type discoverRequest struct {
 	URLs []string `json:"urls"`
-	URL  string   `json:"url"` // single-link convenience
+	URL  string   `json:"url"`
 }
 
 func startHTTPServer(addr string, q *DiscoveryQueue) *http.Server {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":          "ok",
+			"wayback_circuit": waybackBreaker.State(),
+		})
 	})
 
 	mux.HandleFunc("/v1/discover", func(w http.ResponseWriter, r *http.Request) {
@@ -369,17 +389,12 @@ func startHTTPServer(addr string, q *DiscoveryQueue) *http.Server {
 	return srv
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
-
 func main() {
 	cfg := loadConfig()
 	log.Println("🚀 AutoFix Healer Engine starting...")
 
 	if cfg.CFAccountID == "" || cfg.CFAPIToken == "" || cfg.CFKVNamespaceID == "" {
 		log.Println("⚠️  Cloudflare credentials missing — healed links will NOT be written to KV.")
-		log.Println("   Set CF_ACCOUNT_ID, CF_API_TOKEN, CF_KV_NAMESPACE_ID (see .env.example)")
 	}
 
 	client := &http.Client{Timeout: 15 * time.Second}
@@ -391,22 +406,17 @@ func main() {
 	}
 
 	q := NewDiscoveryQueue(10_000)
-
-	// Seed a couple of demo links so the process is immediately useful
 	q.Enqueue("https://dead-example.com/missing-page")
 	q.Enqueue("https://httpstat.us/404")
 
-	// Start worker pool
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.WorkerCount; i++ {
 		wg.Add(1)
 		go runWorker(i, q, kv, client, &wg)
 	}
 
-	// HTTP discovery endpoint (Edge Worker can POST here)
 	srv := startHTTPServer(cfg.ListenAddr, q)
 
-	// Graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	<-ctx.Done()
 	stop()

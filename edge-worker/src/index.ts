@@ -1,5 +1,5 @@
 // The Edge Layer: High-performance HTML streaming rewriter
-// + Cloudflare Queue producer/consumer for durable discovery
+// + Cloudflare Queue producer/consumer + circuit breaker for healer
 
 export interface Env {
   AUTOFIX_KV: KVNamespace;
@@ -30,6 +30,79 @@ function urlKey(url: string): string {
     return encodeURIComponent(url).slice(0, 512);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Circuit breaker (in-isolate) for healer HTTP calls
+// ---------------------------------------------------------------------------
+
+type BreakerState = "closed" | "open" | "half_open";
+
+class CircuitBreaker {
+  private state: BreakerState = "closed";
+  private failures = 0;
+  private openedAt = 0;
+  private halfOpenInFlight = 0;
+
+  constructor(
+    private readonly failureThreshold = 5,
+    private readonly openMs = 30_000,
+    private readonly halfOpenMax = 1
+  ) {}
+
+  get status(): BreakerState {
+    if (this.state === "open" && Date.now() - this.openedAt >= this.openMs) {
+      return "half_open";
+    }
+    return this.state;
+  }
+
+  async exec<T>(fn: () => Promise<T>): Promise<T> {
+    let s = this.state;
+    if (s === "open") {
+      if (Date.now() - this.openedAt < this.openMs) {
+        throw new Error("CircuitOpen");
+      }
+      this.state = "half_open";
+      this.halfOpenInFlight = 0;
+      s = "half_open";
+    }
+
+    if (s === "half_open" && this.halfOpenInFlight >= this.halfOpenMax) {
+      throw new Error("CircuitOpen");
+    }
+    if (s === "half_open") this.halfOpenInFlight++;
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      throw err;
+    }
+  }
+
+  private onSuccess() {
+    this.failures = 0;
+    this.state = "closed";
+    this.halfOpenInFlight = 0;
+  }
+
+  private onFailure() {
+    this.failures++;
+    if (this.state === "half_open" || this.failures >= this.failureThreshold) {
+      this.state = "open";
+      this.openedAt = Date.now();
+      this.halfOpenInFlight = 0;
+      console.warn(
+        `Circuit breaker OPEN after ${this.failures} failure(s); cooling ${this.openMs}ms`
+      );
+    }
+  }
+}
+
+/** Shared breaker for all healer POSTs in this isolate. */
+const healerBreaker = new CircuitBreaker(5, 30_000, 1);
 
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -114,22 +187,22 @@ const worker = {
 
   /**
    * Queue consumer: per-message ack / retry with exponential backoff.
-   * Poison messages are acked so they do not loop forever.
-   * After max_retries, Cloudflare routes to dead_letter_queue (if configured).
+   * Circuit breaker short-circuits when healer is down (messages retry later).
    */
   async queue(batch: MessageBatch<DiscoveryMessage>, env: Env): Promise<void> {
     for (const msg of batch.messages) {
       try {
         const urls = msg.body?.urls;
 
-        // Poison / malformed — ack to avoid infinite retries
         if (!Array.isArray(urls) || urls.length === 0) {
           console.warn(`Invalid message body, acking id=${msg.id}`);
           msg.ack();
           continue;
         }
 
-        const unique = [...new Set(urls.filter((u) => typeof u === "string" && u.length > 0))];
+        const unique = [
+          ...new Set(urls.filter((u) => typeof u === "string" && u.length > 0)),
+        ];
         if (unique.length === 0) {
           msg.ack();
           continue;
@@ -139,13 +212,12 @@ const worker = {
         msg.ack();
       } catch (err) {
         const attempts = msg.attempts ?? 0;
-        console.error(
-          `Message ${msg.id} failed (attempt ${attempts}):`,
-          err instanceof Error ? err.message : err
-        );
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`Message ${msg.id} failed (attempt ${attempts}):`, message);
 
-        // Retry with exponential backoff (cap 1h). After max_retries → DLQ.
-        const delaySeconds = Math.min(60 * 2 ** attempts, 3600);
+        // Longer delay when circuit is open (dependency known-bad)
+        const base = message === "CircuitOpen" ? 120 : 60;
+        const delaySeconds = Math.min(base * 2 ** attempts, 3600);
         msg.retry({ delaySeconds });
       }
     }
@@ -159,42 +231,48 @@ async function forwardToHealer(env: Env, urls: string[]): Promise<void> {
     throw new Error("HEALER_DISCOVER_URL not configured");
   }
 
-  console.log(`Forwarding ${urls.length} url(s) to healer`);
+  await healerBreaker.exec(async () => {
+    console.log(`Forwarding ${urls.length} url(s) to healer`);
 
-  const res = await fetch(env.HEALER_DISCOVER_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ urls }),
-    signal: AbortSignal.timeout(15_000),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Healer ${res.status}: ${text.slice(0, 200)}`);
-  }
-}
-
-async function fallbackHttp(env: Env, urls: string[]): Promise<void> {
-  if (!env.HEALER_DISCOVER_URL) return;
-  try {
-    const res = await fetch(env.HEALER_DISCOVER_URL, {
+    const res = await fetch(env.HEALER_DISCOVER_URL!, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ urls }),
       signal: AbortSignal.timeout(15_000),
     });
+
     if (!res.ok) {
-      console.error(`Healer HTTP ${res.status}: ${await res.text().catch(() => "")}`);
+      const text = await res.text().catch(() => "");
+      throw new Error(`Healer ${res.status}: ${text.slice(0, 200)}`);
     }
+  });
+}
+
+async function fallbackHttp(env: Env, urls: string[]): Promise<void> {
+  if (!env.HEALER_DISCOVER_URL) return;
+  try {
+    await healerBreaker.exec(async () => {
+      const res = await fetch(env.HEALER_DISCOVER_URL!, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urls }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) {
+        throw new Error(`Healer HTTP ${res.status}`);
+      }
+    });
   } catch (err) {
-    console.error("HTTP fallback failed:", err instanceof Error ? err.message : err);
+    console.error(
+      "HTTP fallback failed:",
+      err instanceof Error ? err.message : err
+    );
   }
 }
 
 async function reportDiscoveries(env: Env, urls: string[]): Promise<void> {
   const now = new Date().toISOString();
 
-  // 1. PENDING markers in KV
   if (env.AUTOFIX_KV) {
     await Promise.all(
       urls.map(async (url) => {
@@ -215,7 +293,6 @@ async function reportDiscoveries(env: Env, urls: string[]): Promise<void> {
     );
   }
 
-  // 2. Durable queue (preferred)
   if (env.DISCOVERY_QUEUE) {
     try {
       const message: DiscoveryMessage = { urls, discovered_at: now };
@@ -230,7 +307,6 @@ async function reportDiscoveries(env: Env, urls: string[]): Promise<void> {
     }
   }
 
-  // 3. HTTP fallback
   await fallbackHttp(env, urls);
   console.log(`DISCOVERED ${urls.length} new link(s)`);
 }
