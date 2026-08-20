@@ -1,5 +1,5 @@
 # 🔧 AutoFix: The Self-Healing Web Layer
-
+AutoFix Engine - Architecture & Edge Simulator: https://aistudio.google.com/apps/69748ab5-5005-41fc-b817-64865f3368fe?showPreview=true&showAssistant=true&fullscreenApplet=true
 AutoFix eliminates 404s and broken external links without requiring database migrations.
 
 ### How it works
