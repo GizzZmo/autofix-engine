@@ -7,7 +7,7 @@ AutoFix eliminates 404s and broken external links without requiring database mig
 2. **Lookup** — It checks a global Cloudflare KV registry for the health status of every external link.
 3. **Resolve** — Dead links are hot-swapped with a Wayback Machine archive (and marked `rel="nofollow archived"`).
 4. **Discover** — Unknown links are written as `PENDING` into KV and (optionally) POSTed to the Healer.
-5. **Heal** — A background Go service drains a discovery queue, verifies links, queries the Internet Archive, and writes the healed record back into Cloudflare KV via the official API.
+5. **Heal** — A background Go service drains a discovery queue, verifies links (including soft-404 heuristics), queries the Internet Archive, and writes the healed record back into Cloudflare KV via the official API.
 
 ```
 Browser → Cloudflare Worker (HTMLRewriter + KV) → Origin
@@ -58,9 +58,9 @@ npx wrangler secret put HEALER_DISCOVER_URL
 # enter: https://your-healer-host/v1/discover
 ```
 
-(or add it under `[vars]` in `wrangler.toml` for non-secret values).
-
 ### 3. Run the Healer
+
+**Locally:**
 
 ```bash
 cd healer
@@ -69,6 +69,14 @@ cp .env.example .env
 
 go mod tidy
 go run .
+```
+
+**Docker:**
+
+```bash
+cd healer
+docker build -t autofix-healer .
+docker run --env-file .env -p 8080:8080 autofix-healer
 ```
 
 Required environment variables (see `.env.example`):
@@ -103,12 +111,14 @@ autofix-engine/
 │   ├── package.json
 │   └── tsconfig.json
 ├── healer/
-│   ├── main.go          # Queue, Wayback, CF KV writer, HTTP API
+│   ├── main.go          # Queue, soft-404, Wayback, CF KV writer, HTTP API
 │   ├── go.mod
+│   ├── Dockerfile
 │   └── .env.example
 ├── client/
 │   └── autofix.js
 ├── .github/workflows/ci.yml
+├── .gitignore
 └── README.md
 ```
 
@@ -117,14 +127,25 @@ autofix-engine/
 ## Tech Stack
 
 - **Edge**: TypeScript on Cloudflare Workers (`HTMLRewriter`, KV)
-- **Healer**: Go 1.22 — concurrent queue workers, Wayback Machine, Cloudflare KV REST API
+- **Healer**: Go 1.22 — concurrent queue workers, soft-404 detection, Wayback Machine, Cloudflare KV REST API
 - **Client**: Vanilla JS tooltip / indicator
 - **CI**: GitHub Actions (type-check Worker, build + vet Healer)
 
 ---
 
+## Healer verification pipeline
+
+1. **HEAD** request with browser-like User-Agent  
+2. If non-2xx → mark dead (`http_4xx` / `http_5xx`)  
+3. Else **Range GET** (first 8 KB) and inspect for soft-404 signals:  
+   - `<title>` matching 404 / “not found” / “page missing”  
+   - Body text matching common 404 phrases  
+4. If dead → query Wayback Machine → write `HEALED` or `DEAD` into KV
+
+---
+
 ## Notes & next improvements
 
-- Edge currently does one KV `get` per external link. For high-link-count pages consider a two-phase collect-then-`get` pattern or a Bloom filter to stay under tight TTFB budgets.
-- Soft-404 detection (DOM title / body heuristics) can be added to the healer for SPA sites that return 200 on missing routes.
+- Edge currently does one KV `get` per external link. For high-link-count pages consider a two-phase collect-then-batch pattern or an in-memory Bloom filter.
 - For very high volume, replace the in-process channel with Cloudflare Queues or a durable queue (Redis / NATS).
+- Soft-404 heuristics can be extended with site-specific patterns.

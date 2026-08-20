@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -23,13 +25,12 @@ import (
 // ---------------------------------------------------------------------------
 
 type Config struct {
-	CFAccountID      string
-	CFAPIToken       string
-	CFKVNamespaceID  string
-	ListenAddr       string
-	WorkerCount      int
-	PollInterval     time.Duration
-	UserAgent        string
+	CFAccountID     string
+	CFAPIToken      string
+	CFKVNamespaceID string
+	ListenAddr      string
+	WorkerCount     int
+	UserAgent       string
 }
 
 func loadConfig() Config {
@@ -41,7 +42,6 @@ func loadConfig() Config {
 		CFKVNamespaceID: os.Getenv("CF_KV_NAMESPACE_ID"),
 		ListenAddr:      envOr("HEALER_LISTEN", ":8080"),
 		WorkerCount:     4,
-		PollInterval:    30 * time.Second,
 		UserAgent:       "AutoFix-Healer/1.0 (+https://github.com/GizzZmo/autofix-engine)",
 	}
 }
@@ -63,6 +63,7 @@ type LinkRecord struct {
 	ResolvedURL  string `json:"resolved_url,omitempty"`
 	DiscoveredAt string `json:"discovered_at,omitempty"`
 	HealedAt     string `json:"healed_at,omitempty"`
+	Reason       string `json:"reason,omitempty"` // e.g. http_404, soft_404
 }
 
 // ---------------------------------------------------------------------------
@@ -136,36 +137,87 @@ func CheckArchive(client *http.Client, url string) (string, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Link health check (HEAD + Range GET fallback)
+// Soft-404 heuristics
 // ---------------------------------------------------------------------------
 
-func IsLinkDead(client *http.Client, url string) bool {
+var (
+	soft404TitleRe = regexp.MustCompile(`(?i)(404|not\s+found|page\s+(not\s+found|does\s+not\s+exist|missing)|error\s*404|page\s+moved|gone)`)
+	soft404BodyRe  = regexp.MustCompile(`(?i)(404\s*(not\s+found|error)|this\s+page\s+(could\s+not\s+be\s+found|does\s+not\s+exist)|the\s+requested\s+url\s+was\s+not\s+found)`)
+)
+
+func looksLikeSoft404(body []byte, contentType string) bool {
+	if !strings.Contains(strings.ToLower(contentType), "text/html") {
+		return false
+	}
+	text := string(body)
+	// Extract <title> if present
+	if start := strings.Index(strings.ToLower(text), "<title"); start >= 0 {
+		if gt := strings.Index(text[start:], ">"); gt >= 0 {
+			end := strings.Index(strings.ToLower(text[start+gt:]), "</title>")
+			if end >= 0 {
+				title := text[start+gt+1 : start+gt+end]
+				if soft404TitleRe.MatchString(title) {
+					return true
+				}
+			}
+		}
+	}
+	// Body snippet (first ~8KB is enough)
+	snippet := text
+	if len(snippet) > 8192 {
+		snippet = snippet[:8192]
+	}
+	return soft404BodyRe.MatchString(snippet)
+}
+
+// ---------------------------------------------------------------------------
+// Link health check (HEAD + GET + soft-404)
+// ---------------------------------------------------------------------------
+
+// CheckLink returns (isDead, reason).
+func CheckLink(client *http.Client, url string) (bool, string) {
 	// Primary: HEAD
 	req, err := http.NewRequest(http.MethodHead, url, nil)
 	if err != nil {
-		return true
+		return true, "invalid_url"
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; AutoFix-Healer/1.0)")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return true
+		return true, "network_error"
 	}
 	resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		// Secondary: small Range GET (some servers reject HEAD)
-		req2, _ := http.NewRequest(http.MethodGet, url, nil)
-		req2.Header.Set("User-Agent", "Mozilla/5.0 (compatible; AutoFix-Healer/1.0)")
-		req2.Header.Set("Range", "bytes=0-512")
-		resp2, err2 := client.Do(req2)
-		if err2 != nil {
-			return true
-		}
-		defer resp2.Body.Close()
-		return resp2.StatusCode >= 400
+		return true, fmt.Sprintf("http_%d", resp.StatusCode)
 	}
-	return false
+
+	// Secondary: small GET for soft-404 inspection (and servers that reject HEAD)
+	req2, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return false, ""
+	}
+	req2.Header.Set("User-Agent", "Mozilla/5.0 (compatible; AutoFix-Healer/1.0)")
+	req2.Header.Set("Range", "bytes=0-8191")
+
+	resp2, err := client.Do(req2)
+	if err != nil {
+		// HEAD succeeded; treat as healthy
+		return false, ""
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode >= 400 {
+		return true, fmt.Sprintf("http_%d", resp2.StatusCode)
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(resp2.Body, 8192))
+	ct := resp2.Header.Get("Content-Type")
+	if looksLikeSoft404(body, ct) {
+		return true, "soft_404"
+	}
+	return false, ""
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +279,8 @@ func runWorker(id int, q *DiscoveryQueue, kv *CloudflareKV, client *http.Client,
 	for url := range q.Chan() {
 		log.Printf("[worker-%d] verifying %s", id, url)
 
-		if !IsLinkDead(client, url) {
+		dead, reason := CheckLink(client, url)
+		if !dead {
 			log.Printf("[worker-%d] healthy: %s", id, url)
 			_ = kv.Put(keyFor(url), LinkRecord{
 				Status:      "HEALTHY",
@@ -237,7 +290,7 @@ func runWorker(id int, q *DiscoveryQueue, kv *CloudflareKV, client *http.Client,
 			continue
 		}
 
-		log.Printf("[worker-%d] dead — searching archive for %s", id, url)
+		log.Printf("[worker-%d] dead (%s) — searching archive for %s", id, reason, url)
 		healed, err := CheckArchive(client, url)
 		if err != nil {
 			log.Printf("[worker-%d] no archive: %v", id, err)
@@ -245,6 +298,7 @@ func runWorker(id int, q *DiscoveryQueue, kv *CloudflareKV, client *http.Client,
 				Status:      "DEAD",
 				OriginalURL: url,
 				HealedAt:    time.Now().UTC().Format(time.RFC3339),
+				Reason:      reason,
 			})
 			continue
 		}
@@ -255,6 +309,7 @@ func runWorker(id int, q *DiscoveryQueue, kv *CloudflareKV, client *http.Client,
 			OriginalURL: url,
 			ResolvedURL: healed,
 			HealedAt:    time.Now().UTC().Format(time.RFC3339),
+			Reason:      reason,
 		})
 		if err != nil {
 			log.Printf("[worker-%d] failed to write KV: %v", id, err)
