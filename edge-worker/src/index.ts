@@ -27,7 +27,6 @@ function urlKey(url: string): string {
   try {
     return btoa(unescape(encodeURIComponent(url)));
   } catch {
-    // Extremely defensive fallback
     return encodeURIComponent(url).slice(0, 512);
   }
 }
@@ -46,7 +45,6 @@ const worker = {
       return response;
     }
 
-    // No KV binding configured yet — pass through unchanged
     if (!env.AUTOFIX_KV) {
       return response;
     }
@@ -114,49 +112,84 @@ const worker = {
     }
   },
 
+  /**
+   * Queue consumer: per-message ack / retry with exponential backoff.
+   * Poison messages are acked so they do not loop forever.
+   * After max_retries, Cloudflare routes to dead_letter_queue (if configured).
+   */
   async queue(batch: MessageBatch<DiscoveryMessage>, env: Env): Promise<void> {
-    const allUrls = new Set<string>();
-
     for (const msg of batch.messages) {
       try {
-        const body = msg.body;
-        if (body && Array.isArray(body.urls)) {
-          for (const u of body.urls) {
-            if (typeof u === "string" && u.length > 0) allUrls.add(u);
-          }
+        const urls = msg.body?.urls;
+
+        // Poison / malformed — ack to avoid infinite retries
+        if (!Array.isArray(urls) || urls.length === 0) {
+          console.warn(`Invalid message body, acking id=${msg.id}`);
+          msg.ack();
+          continue;
         }
+
+        const unique = [...new Set(urls.filter((u) => typeof u === "string" && u.length > 0))];
+        if (unique.length === 0) {
+          msg.ack();
+          continue;
+        }
+
+        await forwardToHealer(env, unique);
         msg.ack();
-      } catch {
-        msg.retry();
+      } catch (err) {
+        const attempts = msg.attempts ?? 0;
+        console.error(
+          `Message ${msg.id} failed (attempt ${attempts}):`,
+          err instanceof Error ? err.message : err
+        );
+
+        // Retry with exponential backoff (cap 1h). After max_retries → DLQ.
+        const delaySeconds = Math.min(60 * 2 ** attempts, 3600);
+        msg.retry({ delaySeconds });
       }
-    }
-
-    if (allUrls.size === 0) return;
-
-    const urls = Array.from(allUrls);
-    console.log(`Queue batch: forwarding ${urls.length} url(s) to healer`);
-
-    if (!env.HEALER_DISCOVER_URL) {
-      console.warn("HEALER_DISCOVER_URL not set — batch acked, not forwarded");
-      return;
-    }
-
-    try {
-      const res = await fetch(env.HEALER_DISCOVER_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ urls }),
-      });
-      if (!res.ok) {
-        console.error(`Healer returned ${res.status}`);
-      }
-    } catch (err) {
-      console.error("Failed to forward queue batch to healer:", err);
     }
   },
 };
 
 export default worker;
+
+async function forwardToHealer(env: Env, urls: string[]): Promise<void> {
+  if (!env.HEALER_DISCOVER_URL) {
+    throw new Error("HEALER_DISCOVER_URL not configured");
+  }
+
+  console.log(`Forwarding ${urls.length} url(s) to healer`);
+
+  const res = await fetch(env.HEALER_DISCOVER_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ urls }),
+    signal: AbortSignal.timeout(15_000),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Healer ${res.status}: ${text.slice(0, 200)}`);
+  }
+}
+
+async function fallbackHttp(env: Env, urls: string[]): Promise<void> {
+  if (!env.HEALER_DISCOVER_URL) return;
+  try {
+    const res = await fetch(env.HEALER_DISCOVER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ urls }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) {
+      console.error(`Healer HTTP ${res.status}: ${await res.text().catch(() => "")}`);
+    }
+  } catch (err) {
+    console.error("HTTP fallback failed:", err instanceof Error ? err.message : err);
+  }
+}
 
 async function reportDiscoveries(env: Env, urls: string[]): Promise<void> {
   const now = new Date().toISOString();
@@ -190,22 +223,14 @@ async function reportDiscoveries(env: Env, urls: string[]): Promise<void> {
       console.log(`Queued ${urls.length} link(s) on DISCOVERY_QUEUE`);
       return;
     } catch (err) {
-      console.error("Queue send failed, falling back to HTTP:", err);
+      console.error(
+        "Queue send failed, falling back to HTTP:",
+        err instanceof Error ? err.message : err
+      );
     }
   }
 
   // 3. HTTP fallback
-  if (env.HEALER_DISCOVER_URL) {
-    try {
-      await fetch(env.HEALER_DISCOVER_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ urls }),
-      });
-    } catch (err) {
-      console.error("Failed to push discoveries to healer:", err);
-    }
-  }
-
+  await fallbackHttp(env, urls);
   console.log(`DISCOVERED ${urls.length} new link(s)`);
 }
