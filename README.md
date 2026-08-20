@@ -16,20 +16,38 @@ Browser → Cloudflare Worker (HTMLRewriter + KV)
                 └─ send → Cloudflare Queue (autofix-discovery)
                               │
                               ▼
-                     Queue consumer (same Worker)
+                     Queue consumer + circuit breaker
                               │
                               ▼ POST /v1/discover
-                        Go Healer → Wayback → KV (HEALED/DEAD)
+                        Go Healer → soft-404 check
+                              │
+                              ▼ circuit breaker
+                         Wayback Machine → KV (HEALED / DEAD / PENDING)
 ```
 
 ---
 
-## Deploy (you run these — requires your Cloudflare account)
+## Resilience
+
+| Layer | Mechanism |
+|-------|-----------|
+| **Discovery** | Cloudflare Queues (durable) + HTTP fallback |
+| **Queue consumer** | Per-message `ack` / `retry` with exponential backoff; poison messages acked |
+| **Edge → Healer** | Circuit breaker (5 failures → open 30s → 1 half-open probe) |
+| **Healer → Wayback** | Circuit breaker (5 failures → open 60s); `no archive` does not trip |
+| **On circuit open** | Longer queue retry delay; Wayback open writes `PENDING` + `reason: circuit_open` |
+| **DLQ** | Optional `autofix-discovery-dlq` after `max_retries` |
+
+`GET /healthz` returns `{ "status": "ok", "wayback_circuit": "closed|open|half_open" }`.
+
+---
+
+## Deploy (requires your Cloudflare account)
 
 ### Prerequisites
 ```bash
 npm install -g wrangler   # or use npx
-wrangler login            # opens browser, authorises your CF account
+wrangler login
 ```
 
 ### 1. Create KV + Queues
@@ -38,19 +56,15 @@ wrangler login            # opens browser, authorises your CF account
 cd edge-worker
 npm install
 
-# KV namespaces
 npx wrangler kv:namespace create AUTOFIX_KV
-# → copy the "id"  e.g. a1b2c3d4...
-
 npx wrangler kv:namespace create AUTOFIX_KV --preview
-# → copy the "preview_id"
 
-# Durable discovery queues
 npx wrangler queues create autofix-discovery
+# optional DLQ:
 npx wrangler queues create autofix-discovery-dlq
 ```
 
-Edit `edge-worker/wrangler.toml` and paste the KV ids:
+Paste the KV ids into `edge-worker/wrangler.toml`:
 
 ```toml
 [[kv_namespaces]]
@@ -59,6 +73,8 @@ id = "PASTE_ID_HERE"
 preview_id = "PASTE_PREVIEW_ID_HERE"
 ```
 
+Uncomment `dead_letter_queue` in `wrangler.toml` only after creating the DLQ.
+
 ### 2. Deploy the Worker
 
 ```bash
@@ -66,60 +82,42 @@ cd edge-worker
 npx wrangler deploy
 ```
 
-### 3. Point the Worker at a running healer
-
-Start the healer somewhere reachable (local tunnel, VPS, Fly, Railway, …):
+### 3. Run the healer and set `HEALER_DISCOVER_URL`
 
 ```bash
 cd healer
 cp .env.example .env
-# fill CF_ACCOUNT_ID, CF_API_TOKEN, CF_KV_NAMESPACE_ID
+# CF_ACCOUNT_ID, CF_API_TOKEN, CF_KV_NAMESPACE_ID
 go run .
-# listens on :8080
 ```
 
-Expose it (example with Cloudflare Tunnel or ngrok):
-
-```bash
-# example
-cloudflared tunnel --url http://localhost:8080
-# → https://random.trycloudflare.com
-```
-
-Then set the secret on the Worker:
+Expose it (Cloudflare Tunnel / ngrok), then:
 
 ```bash
 cd edge-worker
 npx wrangler secret put HEALER_DISCOVER_URL
-# paste: https://random.trycloudflare.com/v1/discover
+# https://<tunnel-host>/v1/discover
 ```
-
-Redeploy is not required for secrets; they are available immediately.
 
 ### 4. Verify
 
 ```bash
-# tail live logs
 npx wrangler tail
-
-# hit a page behind the Worker that contains external links
-# you should see DISCOVERED / Queued messages, then healer logs
+curl https://<healer>/healthz
 ```
 
 ---
 
-## Healer env vars
+## Healer
 
 | Variable | Description |
 |----------|-------------|
 | `CF_ACCOUNT_ID` | Cloudflare Account ID |
-| `CF_API_TOKEN` | Token with **Workers KV Storage → Edit** |
-| `CF_KV_NAMESPACE_ID` | Same `id` as in `wrangler.toml` |
+| `CF_API_TOKEN` | **Workers KV Storage → Edit** |
+| `CF_KV_NAMESPACE_ID` | Same KV `id` as in `wrangler.toml` |
 | `HEALER_LISTEN` | Default `:8080` |
 
 Endpoints: `GET /healthz`, `POST /v1/discover`.
-
-Docker:
 
 ```bash
 cd healer
@@ -134,17 +132,19 @@ docker run --env-file .env -p 8080:8080 autofix-healer
 ```
 autofix-engine/
 ├── edge-worker/
-│   ├── src/index.ts      # fetch handler + queue consumer
-│   ├── wrangler.toml     # KV + Queues bindings
+│   ├── src/index.ts         # HTMLRewriter, queue consumer, circuit breaker
+│   ├── wrangler.toml        # KV + Queues
 │   ├── package.json
 │   └── tsconfig.json
 ├── healer/
-│   ├── main.go
+│   ├── main.go              # discovery API, soft-404, Wayback, KV writer
+│   ├── circuitbreaker.go    # Closed / Open / Half-Open
 │   ├── go.mod
 │   ├── Dockerfile
 │   └── .env.example
 ├── client/autofix.js
 ├── .github/workflows/ci.yml
+├── .gitignore
 └── README.md
 ```
 
@@ -152,15 +152,15 @@ autofix-engine/
 
 ## Tech stack
 
-- **Edge**: Cloudflare Workers (`HTMLRewriter`, KV, **Queues**)
-- **Healer**: Go 1.22 — soft-404 heuristics, Wayback Machine, CF KV API
-- **Client**: vanilla JS indicators
-- **CI**: GitHub Actions
+- **Edge**: Cloudflare Workers (`HTMLRewriter`, KV, Queues) + circuit breaker
+- **Healer**: Go 1.22 — soft-404, Wayback circuit breaker, CF KV API
+- **Client**: vanilla JS healed-link indicators
+- **CI**: GitHub Actions (tsc + `go build` / `go vet`)
 
 ---
 
 ## Notes
 
-- Queue path is preferred; HTTP POST remains a fallback when `DISCOVERY_QUEUE` is unavailable.
-- Dead-letter queue `autofix-discovery-dlq` captures poison messages after retries.
-- For multi-million-link sites, increase `max_batch_size` / scale the Go healer horizontally.
+- Prefer Queues for discovery; HTTP is a fallback when the queue binding is missing.
+- Circuit breakers are in-process (per Worker isolate / healer process). Scale horizontally with care, or move shared state later if needed.
+- Soft-404 detection uses title/body heuristics after a successful HTTP status.
