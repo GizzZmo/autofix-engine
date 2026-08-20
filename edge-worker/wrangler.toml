@@ -3,15 +3,34 @@ main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# Create the namespace with:
+# ---------------------------------------------------------------------------
+# KV — create with:
 #   npx wrangler kv:namespace create AUTOFIX_KV
-# Then paste the returned id below (and preview_id for local dev).
+#   npx wrangler kv:namespace create AUTOFIX_KV --preview
+# Then paste the returned ids below.
+# ---------------------------------------------------------------------------
 [[kv_namespaces]]
 binding = "AUTOFIX_KV"
 id = "YOUR_KV_NAMESPACE_ID"
 preview_id = "YOUR_KV_PREVIEW_ID"
 
+# ---------------------------------------------------------------------------
+# Queues — create with:
+#   npx wrangler queues create autofix-discovery
+# ---------------------------------------------------------------------------
+[[queues.producers]]
+binding = "DISCOVERY_QUEUE"
+queue = "autofix-discovery"
+
+[[queues.consumers]]
+queue = "autofix-discovery"
+max_batch_size = 25
+max_batch_timeout = 5
+max_retries = 3
+dead_letter_queue = "autofix-discovery-dlq"
+
 [vars]
 ENVIRONMENT = "production"
-# Optional: URL of the healer discovery endpoint (e.g. https://healer.yourdomain.com/v1/discover)
-# HEALER_DISCOVER_URL = "https://healer.example.com/v1/discover"
+# Optional fallback if you prefer HTTP over Queues:
+# HEALER_DISCOVER_URL is best set as a secret:
+#   npx wrangler secret put HEALER_DISCOVER_URL

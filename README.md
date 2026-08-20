@@ -4,99 +4,127 @@ AutoFix eliminates 404s and broken external links without requiring database mig
 
 ### How it works
 1. **Intercept** — The Edge Worker parses HTML as it leaves your origin.
-2. **Lookup** — It checks a global Cloudflare KV registry for the health status of every external link.
-3. **Resolve** — Dead links are hot-swapped with a Wayback Machine archive (and marked `rel="nofollow archived"`).
-4. **Discover** — Unknown links are written as `PENDING` into KV and (optionally) POSTed to the Healer.
-5. **Heal** — A background Go service drains a discovery queue, verifies links (including soft-404 heuristics), queries the Internet Archive, and writes the healed record back into Cloudflare KV via the official API.
+2. **Lookup** — It checks a global Cloudflare KV registry for every external link.
+3. **Resolve** — Dead links are hot-swapped with a Wayback Machine archive (`rel="nofollow archived"`).
+4. **Discover** — Unknown links are written as `PENDING` into KV and enqueued on **Cloudflare Queues** (with HTTP fallback).
+5. **Heal** — A queue consumer forwards batches to the Go healer, which verifies links (incl. soft-404), queries the Internet Archive, and writes results back into KV.
 
 ```
-Browser → Cloudflare Worker (HTMLRewriter + KV) → Origin
-                ↓ PENDING / HEALED
-           Cloudflare KV  ←  Go Healer (Wayback + CF API)
-                ↑ discovery POST
+Browser → Cloudflare Worker (HTMLRewriter + KV)
+                │
+                ├─ PENDING → KV
+                └─ send → Cloudflare Queue (autofix-discovery)
+                              │
+                              ▼
+                     Queue consumer (same Worker)
+                              │
+                              ▼ POST /v1/discover
+                        Go Healer → Wayback → KV (HEALED/DEAD)
 ```
 
 ---
 
-## Quick Start
+## Deploy (you run these — requires your Cloudflare account)
 
-### 1. Create the Cloudflare KV namespace
+### Prerequisites
+```bash
+npm install -g wrangler   # or use npx
+wrangler login            # opens browser, authorises your CF account
+```
+
+### 1. Create KV + Queues
 
 ```bash
 cd edge-worker
 npm install
 
-# Production namespace
+# KV namespaces
 npx wrangler kv:namespace create AUTOFIX_KV
-# → copy the "id" value
+# → copy the "id"  e.g. a1b2c3d4...
 
-# Preview / local-dev namespace
 npx wrangler kv:namespace create AUTOFIX_KV --preview
-# → copy the "preview_id" value
+# → copy the "preview_id"
+
+# Durable discovery queues
+npx wrangler queues create autofix-discovery
+npx wrangler queues create autofix-discovery-dlq
 ```
 
-Paste both IDs into `edge-worker/wrangler.toml`:
+Edit `edge-worker/wrangler.toml` and paste the KV ids:
 
 ```toml
 [[kv_namespaces]]
 binding = "AUTOFIX_KV"
-id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"          # from the first command
-preview_id = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" # from the --preview command
+id = "PASTE_ID_HERE"
+preview_id = "PASTE_PREVIEW_ID_HERE"
 ```
 
-### 2. Deploy the Edge Worker
+### 2. Deploy the Worker
 
 ```bash
 cd edge-worker
 npx wrangler deploy
 ```
 
-Optional: set the healer discovery URL so the Worker can push new links in real time:
+### 3. Point the Worker at a running healer
 
-```bash
-npx wrangler secret put HEALER_DISCOVER_URL
-# enter: https://your-healer-host/v1/discover
-```
-
-### 3. Run the Healer
-
-**Locally:**
+Start the healer somewhere reachable (local tunnel, VPS, Fly, Railway, …):
 
 ```bash
 cd healer
 cp .env.example .env
-# edit .env with your Cloudflare credentials
-
-go mod tidy
+# fill CF_ACCOUNT_ID, CF_API_TOKEN, CF_KV_NAMESPACE_ID
 go run .
+# listens on :8080
 ```
 
-**Docker:**
+Expose it (example with Cloudflare Tunnel or ngrok):
+
+```bash
+# example
+cloudflared tunnel --url http://localhost:8080
+# → https://random.trycloudflare.com
+```
+
+Then set the secret on the Worker:
+
+```bash
+cd edge-worker
+npx wrangler secret put HEALER_DISCOVER_URL
+# paste: https://random.trycloudflare.com/v1/discover
+```
+
+Redeploy is not required for secrets; they are available immediately.
+
+### 4. Verify
+
+```bash
+# tail live logs
+npx wrangler tail
+
+# hit a page behind the Worker that contains external links
+# you should see DISCOVERED / Queued messages, then healer logs
+```
+
+---
+
+## Healer env vars
+
+| Variable | Description |
+|----------|-------------|
+| `CF_ACCOUNT_ID` | Cloudflare Account ID |
+| `CF_API_TOKEN` | Token with **Workers KV Storage → Edit** |
+| `CF_KV_NAMESPACE_ID` | Same `id` as in `wrangler.toml` |
+| `HEALER_LISTEN` | Default `:8080` |
+
+Endpoints: `GET /healthz`, `POST /v1/discover`.
+
+Docker:
 
 ```bash
 cd healer
 docker build -t autofix-healer .
 docker run --env-file .env -p 8080:8080 autofix-healer
-```
-
-Required environment variables (see `.env.example`):
-
-| Variable | Description |
-|----------|-------------|
-| `CF_ACCOUNT_ID` | Cloudflare Account ID (dashboard sidebar) |
-| `CF_API_TOKEN` | API Token with **Account → Workers KV Storage → Edit** |
-| `CF_KV_NAMESPACE_ID` | The same `id` you put in `wrangler.toml` |
-| `HEALER_LISTEN` | HTTP listen address (default `:8080`) |
-
-The healer exposes:
-
-- `GET  /healthz` — liveness
-- `POST /v1/discover` — body `{"urls":["https://…"]}` or `{"url":"https://…"}`
-
-### 4. Client runtime (optional safety net)
-
-```html
-<script src="/path/to/autofix.js"></script>
 ```
 
 ---
@@ -106,46 +134,33 @@ The healer exposes:
 ```
 autofix-engine/
 ├── edge-worker/
-│   ├── src/index.ts      # HTMLRewriter + KV lookup + discovery
-│   ├── wrangler.toml     # KV binding + vars
+│   ├── src/index.ts      # fetch handler + queue consumer
+│   ├── wrangler.toml     # KV + Queues bindings
 │   ├── package.json
 │   └── tsconfig.json
 ├── healer/
-│   ├── main.go          # Queue, soft-404, Wayback, CF KV writer, HTTP API
+│   ├── main.go
 │   ├── go.mod
 │   ├── Dockerfile
 │   └── .env.example
-├── client/
-│   └── autofix.js
+├── client/autofix.js
 ├── .github/workflows/ci.yml
-├── .gitignore
 └── README.md
 ```
 
 ---
 
-## Tech Stack
+## Tech stack
 
-- **Edge**: TypeScript on Cloudflare Workers (`HTMLRewriter`, KV)
-- **Healer**: Go 1.22 — concurrent queue workers, soft-404 detection, Wayback Machine, Cloudflare KV REST API
-- **Client**: Vanilla JS tooltip / indicator
-- **CI**: GitHub Actions (type-check Worker, build + vet Healer)
-
----
-
-## Healer verification pipeline
-
-1. **HEAD** request with browser-like User-Agent  
-2. If non-2xx → mark dead (`http_4xx` / `http_5xx`)  
-3. Else **Range GET** (first 8 KB) and inspect for soft-404 signals:  
-   - `<title>` matching 404 / “not found” / “page missing”  
-   - Body text matching common 404 phrases  
-4. If dead → query Wayback Machine → write `HEALED` or `DEAD` into KV
+- **Edge**: Cloudflare Workers (`HTMLRewriter`, KV, **Queues**)
+- **Healer**: Go 1.22 — soft-404 heuristics, Wayback Machine, CF KV API
+- **Client**: vanilla JS indicators
+- **CI**: GitHub Actions
 
 ---
 
-## Notes & next improvements
+## Notes
 
-- Edge currently does one KV `get` per external link. For high-link-count pages consider a two-phase collect-then-batch pattern or an in-memory Bloom filter.
-- For very high volume, replace the in-process channel with Cloudflare Queues or a durable queue (Redis / NATS).
-- Soft-404 heuristics can be extended with site-specific patterns.
+- Queue path is preferred; HTTP POST remains a fallback when `DISCOVERY_QUEUE` is unavailable.
+- Dead-letter queue `autofix-discovery-dlq` captures poison messages after retries.
+- For multi-million-link sites, increase `max_batch_size` / scale the Go healer horizontally.

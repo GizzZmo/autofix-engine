@@ -1,6 +1,9 @@
 // The Edge Layer: High-performance HTML streaming rewriter
+// + Cloudflare Queue producer/consumer for durable discovery
+
 export interface Env {
   AUTOFIX_KV: KVNamespace;
+  DISCOVERY_QUEUE?: Queue;
   HEALER_DISCOVER_URL?: string;
   ENVIRONMENT?: string;
 }
@@ -11,20 +14,26 @@ interface LinkRecord {
   resolved_url?: string;
   discovered_at?: string;
   healed_at?: string;
+  reason?: string;
+}
+
+interface DiscoveryMessage {
+  urls: string[];
+  discovered_at: string;
 }
 
 export default {
+  // -----------------------------------------------------------------------
+  // HTTP: intercept HTML and rewrite healed links
+  // -----------------------------------------------------------------------
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const response = await fetch(request);
     const contentType = response.headers.get("content-type") || "";
 
-    // Only process HTML
     if (!contentType.includes("text/html")) {
       return response;
     }
 
-    // Collect unique external hrefs during rewrite so we can fire discovery
-    // without blocking the stream more than necessary.
     const discovered = new Set<string>();
 
     const transformed = new HTMLRewriter()
@@ -35,7 +44,6 @@ export default {
             return;
           }
 
-          // Prefer absolute http(s) links only
           let absolute = href;
           try {
             absolute = new URL(href, request.url).href;
@@ -59,24 +67,61 @@ export default {
       })
       .transform(response);
 
-    // Non-blocking discovery: write PENDING markers + optional push to healer
     if (discovered.size > 0) {
       ctx.waitUntil(reportDiscoveries(env, Array.from(discovered)));
     }
 
     return transformed;
   },
+
+  // -----------------------------------------------------------------------
+  // Queue consumer: durable delivery of discovered links to the Go healer
+  // -----------------------------------------------------------------------
+  async queue(batch: MessageBatch<DiscoveryMessage>, env: Env): Promise<void> {
+    const allUrls = new Set<string>();
+    for (const msg of batch.messages) {
+      for (const u of msg.body.urls || []) {
+        if (u) allUrls.add(u);
+      }
+      msg.ack();
+    }
+
+    if (allUrls.size === 0) return;
+
+    const urls = Array.from(allUrls);
+    console.log(`Queue batch: forwarding ${urls.length} url(s) to healer`);
+
+    if (!env.HEALER_DISCOVER_URL) {
+      console.warn("HEALER_DISCOVER_URL not set — queue messages acked but not forwarded");
+      return;
+    }
+
+    try {
+      const res = await fetch(env.HEALER_DISCOVER_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urls }),
+      });
+      if (!res.ok) {
+        console.error(`Healer returned ${res.status}: ${await res.text()}`);
+        // Do not throw — messages already acked. Retry logic is handled by
+        // the producer path writing PENDING into KV as a fallback.
+      }
+    } catch (err) {
+      console.error("Failed to forward queue batch to healer:", err);
+    }
+  },
 };
 
 async function reportDiscoveries(env: Env, urls: string[]): Promise<void> {
   const now = new Date().toISOString();
 
-  // 1. Write PENDING records into KV so the healer can also pick them up by key
+  // 1. Write PENDING records into KV (source of truth + fallback)
   await Promise.all(
     urls.map(async (url) => {
       const key = btoa(url);
       const existing = await env.AUTOFIX_KV.get(key);
-      if (existing) return; // already known
+      if (existing) return;
 
       const record: LinkRecord = {
         status: "PENDING",
@@ -87,7 +132,21 @@ async function reportDiscoveries(env: Env, urls: string[]): Promise<void> {
     })
   );
 
-  // 2. Optional: push batch to healer discovery endpoint (fire-and-forget)
+  // 2. Prefer durable Queue when available
+  if (env.DISCOVERY_QUEUE) {
+    try {
+      await env.DISCOVERY_QUEUE.send({
+        urls,
+        discovered_at: now,
+      } satisfies DiscoveryMessage);
+      console.log(`Queued ${urls.length} link(s) on DISCOVERY_QUEUE`);
+      return;
+    } catch (err) {
+      console.error("Queue send failed, falling back to HTTP:", err);
+    }
+  }
+
+  // 3. Fallback: direct HTTP POST to healer
   if (env.HEALER_DISCOVER_URL) {
     try {
       await fetch(env.HEALER_DISCOVER_URL, {
