@@ -2,96 +2,129 @@
 
 AutoFix eliminates 404s and broken external links without requiring database migrations.
 
-### How it works:
-1. **Intercept**: The Edge Worker parses HTML as it leaves your server.
-2. **Lookup**: It checks a global KV registry for the health status of every link.
-3. **Resolve**: If a link is dead, it is hot-swapped with a **Wayback Machine** archive or a canonical alternative.
-4. **Learn**: A background Go process crawls your site, finds dead links, and heals them asynchronously.
+### How it works
+1. **Intercept** — The Edge Worker parses HTML as it leaves your origin.
+2. **Lookup** — It checks a global Cloudflare KV registry for the health status of every external link.
+3. **Resolve** — Dead links are hot-swapped with a Wayback Machine archive (and marked `rel="nofollow archived"`).
+4. **Discover** — Unknown links are written as `PENDING` into KV and (optionally) POSTed to the Healer.
+5. **Heal** — A background Go service drains a discovery queue, verifies links, queries the Internet Archive, and writes the healed record back into Cloudflare KV via the official API.
 
-### Setup
-1. `cd edge-worker && npm install && wrangler publish`
-2. `cd healer && go run main.go`
-3. Include `<script src="autofix.js"></script>` in your site footer.
+```
+Browser → Cloudflare Worker (HTMLRewriter + KV) → Origin
+                ↓ PENDING / HEALED
+           Cloudflare KV  ←  Go Healer (Wayback + CF API)
+                ↑ discovery POST
+```
 
-### Tech Stack
-- **Language**: TypeScript (Edge), Go (Backend), JavaScript (Browser).
-- **Runtime**: Cloudflare Workers, Internet Archive API.
-- **Data**: Edge KV (Global low-latency store).
+---
 
+## Quick Start
 
-Architecture Review & Design Feedback: AutoFix Engine
+### 1. Create the Cloudflare KV namespace
 
-Evaluated Document: AutoFix: Automated Link Health & Edge-Resolution Engine
+```bash
+cd edge-worker
+npm install
 
-Document Type: Professional / Technical System Architectural Blueprint
+# Production namespace
+npx wrangler kv:namespace create AUTOFIX_KV
+# → copy the "id" value
 
-Target Audience: Senior Systems Architects, Edge Infrastructure Engineers, and Engineering Leadership
+# Preview / local-dev namespace
+npx wrangler kv:namespace create AUTOFIX_KV --preview
+# → copy the "preview_id" value
+```
 
-1. Executive Summary & Assessment
+Paste both IDs into `edge-worker/wrangler.toml`:
 
-Your architectural blueprint for AutoFix presents a remarkably clean, modular, and forward-thinking edge architecture for solving a ubiquitous web health problem.
+```toml
+[[kv_namespaces]]
+binding = "AUTOFIX_KV"
+id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"          # from the first command
+preview_id = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" # from the --preview command
+```
 
-Proficiency Level: Good
+### 2. Deploy the Edge Worker
 
-Assessment Rubric
+```bash
+cd edge-worker
+npx wrangler deploy
+```
 
-Technical Precision & Edge Soundness: Good — Solid understanding of edge proxy architecture, though edge async non-blocking execution requires finer refinement.
+Optional: set the healer discovery URL so the Worker can push new links in real time:
 
-Architecture Completeness: Good — Clear end-to-end data flow, though SEO implications and edge failure modes need explicit protocols.
+```bash
+npx wrangler secret put HEALER_DISCOVER_URL
+# enter: https://your-healer-host/v1/discover
+```
 
-Organization & Readability: Outstanding — Logical section progression, ASCII flow diagram, and structured pseudo-code.
+(or add it under `[vars]` in `wrangler.toml` for non-secret values).
 
-Operational Guardrails: Good — Quantitative target ($T_{\text{TTFB}} < 3\text{ms}$) defined, but false-positive detection needs hardening.
+### 3. Run the Healer
 
-2. Key Growth Areas & Technical Recommendations
+```bash
+cd healer
+cp .env.example .env
+# edit .env with your Cloudflare credentials
 
-Area 1: Edge Runtime Latency & Streaming Execution (Technical Precision)
+go mod tidy
+go run .
+```
 
-Specific Text Example: Section 7 (Edge Processing Logic) pseudo-code:
+Required environment variables (see `.env.example`):
 
-const linkHash = await hashUrl(href);
-const linkMetadata = await AUTOFIX_KV.get(linkHash, { type: 'json' });
+| Variable | Description |
+|----------|-------------|
+| `CF_ACCOUNT_ID` | Cloudflare Account ID (dashboard sidebar) |
+| `CF_API_TOKEN` | API Token with **Account → Workers KV Storage → Edit** |
+| `CF_KV_NAMESPACE_ID` | The same `id` you put in `wrangler.toml` |
+| `HEALER_LISTEN` | HTTP listen address (default `:8080`) |
 
+The healer exposes:
 
-Issue: Executing an asynchronous $I/O$ call (await AUTOFIX_KV.get()) inside the element(element) handler of HTMLRewriter for every <a> tag forces the edge streaming parser to pause stream processing. On pages with 50+ links, sequential KV calls will quickly exceed your target Time to First Byte limit ($T_{\text{TTFB}} < 3\text{ms}$).
+- `GET  /healthz` — liveness
+- `POST /v1/discover` — body `{"urls":["https://…"]}` or `{"url":"https://…"}`
 
-Actionable Next Step: How about updating Section 7 to specify a two-phase edge processing pattern?
+### 4. Client runtime (optional safety net)
 
-Phase 1 (Collect): Fast synchronous pass over the HTML stream to extract all unique href attributes.
+```html
+<script src="/path/to/autofix.js"></script>
+```
 
-Phase 2 (Batch Lookup): A single batched multi-key lookup (AUTOFIX_KV.getMany() or in-memory sub-request cache) before stream rewriting, or using an in-memory Bloom filter at the edge worker instance layer to immediately bypass healthy links without KV I/O.
+---
 
-Area 2: SEO & Search Crawler Protocols (Architectural Completeness)
+## Project layout
 
-Specific Text Example: Section 5 (Mode 1) states: "SEO crawlers receive updated, valid links directly" and Section 6 outlines replacing dead links with Internet Archive targets.
+```
+autofix-engine/
+├── edge-worker/
+│   ├── src/index.ts      # HTMLRewriter + KV lookup + discovery
+│   ├── wrangler.toml     # KV binding + vars
+│   ├── package.json
+│   └── tsconfig.json
+├── healer/
+│   ├── main.go          # Queue, Wayback, CF KV writer, HTTP API
+│   ├── go.mod
+│   └── .env.example
+├── client/
+│   └── autofix.js
+├── .github/workflows/ci.yml
+└── README.md
+```
 
-Issue: Automatically rewriting dead links to external domains (like web.archive.org) without metadata annotations can accidentally dilute page rank or cause search crawlers to index third-party mirror pages instead of recognizing broken internal link structures.
+---
 
-Actionable Next Step: Would you like to add an explicit "SEO & Crawler Policy" subsection to Section 6? This should detail:
+## Tech Stack
 
-Injecting rel="nofollow archived" attributes when substituting third-party Wayback Machine links.
+- **Edge**: TypeScript on Cloudflare Workers (`HTMLRewriter`, KV)
+- **Healer**: Go 1.22 — concurrent queue workers, Wayback Machine, Cloudflare KV REST API
+- **Client**: Vanilla JS tooltip / indicator
+- **CI**: GitHub Actions (type-check Worker, build + vet Healer)
 
-Serving conditional responses based on User-Agent (e.g., returning standard HTTP 301/307 redirects for search bots while serving inline JS modal fallbacks for real human visitors).
+---
 
-Area 3: False-Positive Prevention & Verification Protocols (Operational Guardrails)
+## Notes & next improvements
 
-Specific Text Example: Section 4.2 (Healing Pipeline):
-
-
-$$\text{Target Link} \rightarrow [\text{HEAD Request}] \rightarrow \text{Status 200 OK?}$$
-
-Issue: Modern edge firewalls (Cloudflare, Akamai) and Single Page Application (SPA) servers frequently reject automated HEAD requests with 403 Forbidden or 405 Method Not Allowed, or return 200 OK alongside a JavaScript-rendered "Soft 404" page. Relying solely on HTTP HEAD status codes will create significant false-positive flags.
-
-Actionable Next Step: Consider expanding Section 4.2 to introduce a multi-tiered validation heuristic:
-
-Primary: HEAD request with standard browser User-Agent.
-
-Secondary Fallback: Range-header GET request (e.g., Range: bytes=0-1024) if HEAD returns 403/405.
-
-Soft 404 Detection: HTML DOM inspection checking for page title strings like "404 Not Found", "Page Moved", or DOM text length thresholds.
-
-3. Summary of Suggested Edits
-
-  Section 4.2  -> Add HTTP GET Range request fallback and Soft-404 DOM signatures.
-  Section 6    -> Add explicit SEO attributes (rel="nofollow", 301 vs 302 handling).
-  Section 7    -> Optimize pseudo-code to prevent async blocking in HTMLRewriter stream.
+- Edge currently does one KV `get` per external link. For high-link-count pages consider a two-phase collect-then-`get` pattern or a Bloom filter to stay under tight TTFB budgets.
+- Soft-404 detection (DOM title / body heuristics) can be added to the healer for SPA sites that return 200 on missing routes.
+- For very high volume, replace the in-process channel with Cloudflare Queues or a durable queue (Redis / NATS).

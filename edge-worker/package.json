@@ -1,0 +1,19 @@
+{
+  "name": "autofix-edge-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AutoFix Cloudflare Worker - HTML streaming rewriter",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "kv:create": "wrangler kv:namespace create AUTOFIX_KV",
+    "kv:create-preview": "wrangler kv:namespace create AUTOFIX_KV --preview"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240925.0",
+    "typescript": "^5.6.2",
+    "wrangler": "^3.78.0"
+  }
+}

@@ -1,10 +1,17 @@
 name = "autofix-proxy"
 main = "src/index.ts"
-compatibility_date = "2024-01-01"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
 
+# Create the namespace with:
+#   npx wrangler kv:namespace create AUTOFIX_KV
+# Then paste the returned id below (and preview_id for local dev).
 [[kv_namespaces]]
 binding = "AUTOFIX_KV"
 id = "YOUR_KV_NAMESPACE_ID"
+preview_id = "YOUR_KV_PREVIEW_ID"
 
 [vars]
 ENVIRONMENT = "production"
+# Optional: URL of the healer discovery endpoint (e.g. https://healer.yourdomain.com/v1/discover)
+# HEALER_DISCOVER_URL = "https://healer.example.com/v1/discover"
