@@ -1,6 +1,10 @@
 # 🔧 AutoFix: The Self-Healing Web Layer
-AutoFix Engine - Architecture & Edge Simulator: https://aistudio.google.com/apps/69748ab5-5005-41fc-b817-64865f3368fe?showPreview=true&showAssistant=true&fullscreenApplet=true
+
+[Architecture & Edge Simulator](https://aistudio.google.com/apps/69748ab5-5005-41fc-b817-64865f3368fe?showPreview=true&showAssistant=true&fullscreenApplet=true)
+
 AutoFix eliminates 404s and broken external links without requiring database migrations.
+
+**Full deployment guide → [DEPLOY.md](./DEPLOY.md)**
 
 ### How it works
 1. **Intercept** — The Edge Worker parses HTML as it leaves your origin.
@@ -42,73 +46,37 @@ Browser → Cloudflare Worker (HTMLRewriter + KV)
 
 ---
 
-## Deploy (requires your Cloudflare account)
+## Quick start deploy
 
-### Prerequisites
 ```bash
-npm install -g wrangler   # or use npx
 wrangler login
-```
+cd edge-worker && npm install
 
-### 1. Create KV + Queues
-
-```bash
-cd edge-worker
-npm install
-
+# 1. KV + Queue
 npx wrangler kv:namespace create AUTOFIX_KV
 npx wrangler kv:namespace create AUTOFIX_KV --preview
-
 npx wrangler queues create autofix-discovery
-# optional DLQ:
-npx wrangler queues create autofix-discovery-dlq
-```
+# paste ids into wrangler.toml
 
-Paste the KV ids into `edge-worker/wrangler.toml`:
-
-```toml
-[[kv_namespaces]]
-binding = "AUTOFIX_KV"
-id = "PASTE_ID_HERE"
-preview_id = "PASTE_PREVIEW_ID_HERE"
-```
-
-Uncomment `dead_letter_queue` in `wrangler.toml` only after creating the DLQ.
-
-### 2. Deploy the Worker
-
-```bash
-cd edge-worker
+# 2. Worker
 npx wrangler deploy
-```
 
-### 3. Run the healer and set `HEALER_DISCOVER_URL`
-
-```bash
-cd healer
-cp .env.example .env
-# CF_ACCOUNT_ID, CF_API_TOKEN, CF_KV_NAMESPACE_ID
+# 3. Healer (separate terminal)
+cd ../healer && cp .env.example .env   # fill CF_* vars
 go run .
-```
+# expose with: cloudflared tunnel --url http://localhost:8080
 
-Expose it (Cloudflare Tunnel / ngrok), then:
-
-```bash
-cd edge-worker
+# 4. Wire secret
+cd ../edge-worker
 npx wrangler secret put HEALER_DISCOVER_URL
-# https://<tunnel-host>/v1/discover
+# https://<tunnel>/v1/discover
 ```
 
-### 4. Verify
-
-```bash
-npx wrangler tail
-curl https://<healer>/healthz
-```
+Step-by-step (Docker, systemd, routes, troubleshooting): **[DEPLOY.md](./DEPLOY.md)**.
 
 ---
 
-## Healer
+## Healer env vars
 
 | Variable | Description |
 |----------|-------------|
@@ -137,12 +105,13 @@ autofix-engine/
 │   ├── package.json
 │   └── tsconfig.json
 ├── healer/
-│   ├── main.go              # discovery API, soft-404, Wayback, KV writer
-│   ├── circuitbreaker.go    # Closed / Open / Half-Open
+│   ├── main.go
+│   ├── circuitbreaker.go
 │   ├── go.mod
 │   ├── Dockerfile
 │   └── .env.example
 ├── client/autofix.js
+├── DEPLOY.md
 ├── .github/workflows/ci.yml
 ├── .gitignore
 └── README.md
@@ -162,5 +131,5 @@ autofix-engine/
 ## Notes
 
 - Prefer Queues for discovery; HTTP is a fallback when the queue binding is missing.
-- Circuit breakers are in-process (per Worker isolate / healer process). Scale horizontally with care, or move shared state later if needed.
+- Circuit breakers are in-process (per Worker isolate / healer process).
 - Soft-404 detection uses title/body heuristics after a successful HTTP status.
