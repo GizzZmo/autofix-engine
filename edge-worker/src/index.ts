@@ -3,7 +3,7 @@
 
 export interface Env {
   AUTOFIX_KV: KVNamespace;
-  DISCOVERY_QUEUE?: Queue;
+  DISCOVERY_QUEUE?: Queue<DiscoveryMessage>;
   HEALER_DISCOVER_URL?: string;
   ENVIRONMENT?: string;
 }
@@ -22,68 +22,113 @@ interface DiscoveryMessage {
   discovered_at: string;
 }
 
-export default {
-  // -----------------------------------------------------------------------
-  // HTTP: intercept HTML and rewrite healed links
-  // -----------------------------------------------------------------------
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const response = await fetch(request);
-    const contentType = response.headers.get("content-type") || "";
+/** Safe base64 key for arbitrary URLs (handles Unicode). */
+function urlKey(url: string): string {
+  try {
+    return btoa(unescape(encodeURIComponent(url)));
+  } catch {
+    // Extremely defensive fallback
+    return encodeURIComponent(url).slice(0, 512);
+  }
+}
 
+const worker = {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    let response: Response;
+    try {
+      response = await fetch(request);
+    } catch {
+      return new Response("Bad Gateway", { status: 502 });
+    }
+
+    const contentType = response.headers.get("content-type") || "";
     if (!contentType.includes("text/html")) {
+      return response;
+    }
+
+    // No KV binding configured yet — pass through unchanged
+    if (!env.AUTOFIX_KV) {
       return response;
     }
 
     const discovered = new Set<string>();
 
-    const transformed = new HTMLRewriter()
-      .on("a[href]", {
-        async element(element) {
-          const href = element.getAttribute("href");
-          if (!href || href.startsWith("/") || href.startsWith("#") || href.startsWith("mailto:")) {
-            return;
-          }
+    try {
+      const transformed = new HTMLRewriter()
+        .on("a[href]", {
+          async element(element) {
+            try {
+              const href = element.getAttribute("href");
+              if (
+                !href ||
+                href.startsWith("/") ||
+                href.startsWith("#") ||
+                href.startsWith("mailto:") ||
+                href.startsWith("javascript:")
+              ) {
+                return;
+              }
 
-          let absolute = href;
-          try {
-            absolute = new URL(href, request.url).href;
-          } catch {
-            return;
-          }
-          if (!absolute.startsWith("http")) return;
+              let absolute: string;
+              try {
+                absolute = new URL(href, request.url).href;
+              } catch {
+                return;
+              }
+              if (!absolute.startsWith("http://") && !absolute.startsWith("https://")) {
+                return;
+              }
 
-          const urlHash = btoa(absolute);
-          const cached = (await env.AUTOFIX_KV.get(urlHash, { type: "json" })) as LinkRecord | null;
+              const key = urlKey(absolute);
+              const cached = (await env.AUTOFIX_KV.get(key, {
+                type: "json",
+              })) as LinkRecord | null;
 
-          if (cached?.status === "HEALED" && cached.resolved_url) {
-            element.setAttribute("href", cached.resolved_url);
-            element.setAttribute("data-autofix-original", absolute);
-            element.setAttribute("rel", "nofollow archived");
-            element.classList.add("autofix-healed");
-          } else if (!cached) {
-            discovered.add(absolute);
-          }
-        },
-      })
-      .transform(response);
+              if (cached?.status === "HEALED" && cached.resolved_url) {
+                element.setAttribute("href", cached.resolved_url);
+                element.setAttribute("data-autofix-original", absolute);
+                element.setAttribute("rel", "nofollow archived");
+                element.classList.add("autofix-healed");
+              } else if (!cached) {
+                discovered.add(absolute);
+              }
+            } catch {
+              // Never break the stream for a single link
+            }
+          },
+        })
+        .transform(response);
 
-    if (discovered.size > 0) {
-      ctx.waitUntil(reportDiscoveries(env, Array.from(discovered)));
+      if (discovered.size > 0) {
+        ctx.waitUntil(
+          reportDiscoveries(env, Array.from(discovered)).catch((err) => {
+            console.error("reportDiscoveries failed:", err);
+          })
+        );
+      }
+
+      return transformed;
+    } catch (err) {
+      console.error("HTMLRewriter failed, returning original:", err);
+      return response;
     }
-
-    return transformed;
   },
 
-  // -----------------------------------------------------------------------
-  // Queue consumer: durable delivery of discovered links to the Go healer
-  // -----------------------------------------------------------------------
   async queue(batch: MessageBatch<DiscoveryMessage>, env: Env): Promise<void> {
     const allUrls = new Set<string>();
+
     for (const msg of batch.messages) {
-      for (const u of msg.body.urls || []) {
-        if (u) allUrls.add(u);
+      try {
+        const body = msg.body;
+        if (body && Array.isArray(body.urls)) {
+          for (const u of body.urls) {
+            if (typeof u === "string" && u.length > 0) allUrls.add(u);
+          }
+        }
+        msg.ack();
+      } catch {
+        msg.retry();
       }
-      msg.ack();
     }
 
     if (allUrls.size === 0) return;
@@ -92,7 +137,7 @@ export default {
     console.log(`Queue batch: forwarding ${urls.length} url(s) to healer`);
 
     if (!env.HEALER_DISCOVER_URL) {
-      console.warn("HEALER_DISCOVER_URL not set — queue messages acked but not forwarded");
+      console.warn("HEALER_DISCOVER_URL not set — batch acked, not forwarded");
       return;
     }
 
@@ -103,9 +148,7 @@ export default {
         body: JSON.stringify({ urls }),
       });
       if (!res.ok) {
-        console.error(`Healer returned ${res.status}: ${await res.text()}`);
-        // Do not throw — messages already acked. Retry logic is handled by
-        // the producer path writing PENDING into KV as a fallback.
+        console.error(`Healer returned ${res.status}`);
       }
     } catch (err) {
       console.error("Failed to forward queue batch to healer:", err);
@@ -113,32 +156,37 @@ export default {
   },
 };
 
+export default worker;
+
 async function reportDiscoveries(env: Env, urls: string[]): Promise<void> {
   const now = new Date().toISOString();
 
-  // 1. Write PENDING records into KV (source of truth + fallback)
-  await Promise.all(
-    urls.map(async (url) => {
-      const key = btoa(url);
-      const existing = await env.AUTOFIX_KV.get(key);
-      if (existing) return;
+  // 1. PENDING markers in KV
+  if (env.AUTOFIX_KV) {
+    await Promise.all(
+      urls.map(async (url) => {
+        try {
+          const key = urlKey(url);
+          const existing = await env.AUTOFIX_KV.get(key);
+          if (existing) return;
+          const record: LinkRecord = {
+            status: "PENDING",
+            original_url: url,
+            discovered_at: now,
+          };
+          await env.AUTOFIX_KV.put(key, JSON.stringify(record));
+        } catch (err) {
+          console.error("KV put failed for", url, err);
+        }
+      })
+    );
+  }
 
-      const record: LinkRecord = {
-        status: "PENDING",
-        original_url: url,
-        discovered_at: now,
-      };
-      await env.AUTOFIX_KV.put(key, JSON.stringify(record));
-    })
-  );
-
-  // 2. Prefer durable Queue when available
+  // 2. Durable queue (preferred)
   if (env.DISCOVERY_QUEUE) {
     try {
-      await env.DISCOVERY_QUEUE.send({
-        urls,
-        discovered_at: now,
-      } satisfies DiscoveryMessage);
+      const message: DiscoveryMessage = { urls, discovered_at: now };
+      await env.DISCOVERY_QUEUE.send(message);
       console.log(`Queued ${urls.length} link(s) on DISCOVERY_QUEUE`);
       return;
     } catch (err) {
@@ -146,7 +194,7 @@ async function reportDiscoveries(env: Env, urls: string[]): Promise<void> {
     }
   }
 
-  // 3. Fallback: direct HTTP POST to healer
+  // 3. HTTP fallback
   if (env.HEALER_DISCOVER_URL) {
     try {
       await fetch(env.HEALER_DISCOVER_URL, {

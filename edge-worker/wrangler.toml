@@ -17,6 +17,8 @@ preview_id = "YOUR_KV_PREVIEW_ID"
 # ---------------------------------------------------------------------------
 # Queues — create with:
 #   npx wrangler queues create autofix-discovery
+# DLQ is optional; create only if you enable dead_letter_queue below:
+#   npx wrangler queues create autofix-discovery-dlq
 # ---------------------------------------------------------------------------
 [[queues.producers]]
 binding = "DISCOVERY_QUEUE"
@@ -27,10 +29,8 @@ queue = "autofix-discovery"
 max_batch_size = 25
 max_batch_timeout = 5
 max_retries = 3
-dead_letter_queue = "autofix-discovery-dlq"
+# Uncomment after creating the DLQ:
+# dead_letter_queue = "autofix-discovery-dlq"
 
 [vars]
 ENVIRONMENT = "production"
-# Optional fallback if you prefer HTTP over Queues:
-# HEALER_DISCOVER_URL is best set as a secret:
-#   npx wrangler secret put HEALER_DISCOVER_URL
