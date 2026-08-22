@@ -8,36 +8,61 @@ on:
       - "edge-worker/**"
       - ".github/workflows/deploy-edge.yml"
 
+# Required GitHub Actions secrets:
+#   CLOUDFLARE_API_TOKEN   — Account → Workers Scripts Edit (+ Queues/KV as needed)
+#   CLOUDFLARE_ACCOUNT_ID  — Cloudflare account id
+#
+# wrangler.toml must use real KV namespace ids (not YOUR_KV_* placeholders).
+# HEALER_DISCOVER_URL is set once via: npx wrangler secret put HEALER_DISCOVER_URL
+
 jobs:
   deploy:
     name: Deploy to Cloudflare
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: edge-worker
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: edge-worker/package.json
 
-      - run: npm install
+      - name: Install dependencies
+        working-directory: edge-worker
+        run: npm install
 
       - name: Type-check
+        working-directory: edge-worker
         run: npx tsc --noEmit
 
-      - name: Deploy
+      - name: Guard against placeholder KV ids
+        working-directory: edge-worker
+        run: |
+          if grep -q 'YOUR_KV_NAMESPACE_ID' wrangler.toml; then
+            echo "::error::wrangler.toml still has YOUR_KV_NAMESPACE_ID."
+            echo "Create namespaces, paste real ids into wrangler.toml, commit, then re-run."
+            echo "See DEPLOY.md / scripts/setup-cloudflare.sh"
+            exit 1
+          fi
+
+      - name: Check secrets
+        run: |
+          if [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]; then
+            echo "::error::Missing secret CLOUDFLARE_API_TOKEN"
+            exit 1
+          fi
+          if [ -z "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ]; then
+            echo "::error::Missing secret CLOUDFLARE_ACCOUNT_ID"
+            exit 1
+          fi
+
+      - name: Deploy with Wrangler
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: edge-worker
+          packageManager: npm
+          wranglerVersion: "3.114.0"
           command: deploy
-        # Requires GitHub secrets:
-        #   CLOUDFLARE_API_TOKEN  — Workers edit + account read
-        #   CLOUDFLARE_ACCOUNT_ID
-        # KV ids must already be set in wrangler.toml (committed or via env).
-        # Set HEALER_DISCOVER_URL once via: wrangler secret put (not in CI by default).
