@@ -12,7 +12,7 @@ on:
 #   CLOUDFLARE_API_TOKEN   — Account → Workers Scripts Edit (+ Queues/KV as needed)
 #   CLOUDFLARE_ACCOUNT_ID  — Cloudflare account id
 #
-# wrangler.toml must use real KV namespace ids (not YOUR_KV_* placeholders).
+# wrangler.toml must use real 32-char hex KV namespace ids (not YOUR_KV_* placeholders).
 # HEALER_DISCOVER_URL is set once via: npx wrangler secret put HEALER_DISCOVER_URL
 
 jobs:
@@ -36,15 +36,10 @@ jobs:
         working-directory: edge-worker
         run: npx tsc --noEmit
 
-      - name: Guard against placeholder KV ids
-        working-directory: edge-worker
+      - name: Validate KV namespace ids
         run: |
-          if grep -q 'YOUR_KV_NAMESPACE_ID' wrangler.toml; then
-            echo "::error::wrangler.toml still has YOUR_KV_NAMESPACE_ID."
-            echo "Create namespaces, paste real ids into wrangler.toml, commit, then re-run."
-            echo "See DEPLOY.md / scripts/setup-cloudflare.sh"
-            exit 1
-          fi
+          chmod +x scripts/check-wrangler-kv.sh
+          ./scripts/check-wrangler-kv.sh edge-worker/wrangler.toml
 
       - name: Check secrets
         run: |
