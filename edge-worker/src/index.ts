@@ -31,6 +31,16 @@ function urlKey(url: string): string {
   }
 }
 
+/** HTMLRewriter Element has no classList — append a class token safely. */
+function addClass(element: Element, token: string): void {
+  const existing = element.getAttribute("class") || "";
+  const parts = existing.split(/\s+/).filter(Boolean);
+  if (!parts.includes(token)) {
+    parts.push(token);
+    element.setAttribute("class", parts.join(" "));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Circuit breaker (in-isolate) for healer HTTP calls
 // ---------------------------------------------------------------------------
@@ -159,7 +169,7 @@ const worker = {
                 element.setAttribute("href", cached.resolved_url);
                 element.setAttribute("data-autofix-original", absolute);
                 element.setAttribute("rel", "nofollow archived");
-                element.classList.add("autofix-healed");
+                addClass(element, "autofix-healed");
               } else if (!cached) {
                 discovered.add(absolute);
               }
@@ -215,7 +225,6 @@ const worker = {
         const message = err instanceof Error ? err.message : String(err);
         console.error(`Message ${msg.id} failed (attempt ${attempts}):`, message);
 
-        // Longer delay when circuit is open (dependency known-bad)
         const base = message === "CircuitOpen" ? 120 : 60;
         const delaySeconds = Math.min(base * 2 ** attempts, 3600);
         msg.retry({ delaySeconds });
