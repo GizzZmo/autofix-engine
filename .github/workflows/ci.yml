@@ -35,9 +35,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
+          cache-dependency-path: healer/go.sum
       - name: Download modules
         run: go mod download
       - name: Build
         run: go build -o autofix-healer .
       - name: Vet
         run: go vet ./...
+      - name: Test
+        run: go test ./...

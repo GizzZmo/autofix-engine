@@ -2,6 +2,8 @@
 
 End-to-end instructions to deploy the Edge Worker (Cloudflare) and the Go Healer.
 
+Also see: `Makefile`, `scripts/setup-cloudflare.sh`, `docker-compose.yml`.
+
 ---
 
 ## Architecture at deploy time
@@ -28,20 +30,11 @@ You need:
 ## 0. Prerequisites
 
 ```bash
-# Node 18+
-node -v
-
-# Go 1.22+ (for local healer builds)
-go version
-
-# Wrangler
-npm install -g wrangler
-# or use npx wrangler …
-
+node -v    # 18+
+go version # 1.22+
+npm install -g wrangler   # or use npx
 wrangler login
 ```
-
-Clone the repo:
 
 ```bash
 git clone https://github.com/GizzZmo/autofix-engine.git
@@ -50,81 +43,61 @@ cd autofix-engine
 
 ---
 
-## 1. Cloudflare resources
+## 1. Bootstrap Cloudflare resources
 
-### 1.1 KV namespaces
+### Automated
 
 ```bash
-cd edge-worker
-npm install
+chmod +x scripts/setup-cloudflare.sh
+./scripts/setup-cloudflare.sh
+```
+
+### Manual
+
+```bash
+cd edge-worker && npm install
 
 npx wrangler kv:namespace create AUTOFIX_KV
-# Output includes: id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-
 npx wrangler kv:namespace create AUTOFIX_KV --preview
-# Output includes: preview_id = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
-```
-
-Edit `edge-worker/wrangler.toml`:
-
-```toml
-[[kv_namespaces]]
-binding = "AUTOFIX_KV"
-id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-preview_id = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
-```
-
-### 1.2 Queues
-
-```bash
 npx wrangler queues create autofix-discovery
-
-# Optional dead-letter queue
-npx wrangler queues create autofix-discovery-dlq
+npx wrangler queues create autofix-discovery-dlq   # optional
 ```
 
-If you created the DLQ, uncomment in `wrangler.toml`:
+Paste KV `id` / `preview_id` into `edge-worker/wrangler.toml`.
 
-```toml
-[[queues.consumers]]
-queue = "autofix-discovery"
-# …
-dead_letter_queue = "autofix-discovery-dlq"
-```
+Uncomment `dead_letter_queue` only after creating the DLQ.
 
-### 1.3 API token for the healer
+### API token for the healer
 
-1. Open [Cloudflare API Tokens](https://dash.cloudflare.com/profile/api-tokens)
-2. **Create Token** → custom token
-3. Permissions: **Account → Workers KV Storage → Edit**
-4. Account Resources: include your account
-5. Copy the token (shown once)
-
-Also note your **Account ID** (dashboard sidebar / Workers overview).
+1. [API Tokens](https://dash.cloudflare.com/profile/api-tokens) → Create Token
+2. Permission: **Account → Workers KV Storage → Edit**
+3. Copy token + Account ID (dashboard sidebar)
 
 ---
 
 ## 2. Deploy the Edge Worker
 
 ```bash
-cd edge-worker
-npx wrangler deploy
+make edge-deploy
+# or: cd edge-worker && npx wrangler deploy
 ```
 
-Note the workers.dev URL (or attach a custom route in the dashboard):
+### CI deploy (optional)
 
-```text
-https://autofix-proxy.<your-subdomain>.workers.dev
-```
+Repo → Settings → Secrets:
 
-### Routes (production)
+| Secret | Value |
+|--------|--------|
+| `CLOUDFLARE_API_TOKEN` | Token with Workers deploy rights |
+| `CLOUDFLARE_ACCOUNT_ID` | Account ID |
 
-In the Cloudflare dashboard → Workers → `autofix-proxy` → Triggers:
+Workflow: `.github/workflows/deploy-edge.yml` (runs on `main` pushes under `edge-worker/`, or **workflow_dispatch**).
 
-- Add route: `yoursite.com/*` (or a path prefix)
-- Ensure the zone is on Cloudflare DNS/proxy
+Set `HEALER_DISCOVER_URL` once manually (`wrangler secret put`) — not injected by CI by default.
 
-Or in `wrangler.toml`:
+### Custom routes
+
+Dashboard → Worker → Triggers, or in `wrangler.toml`:
 
 ```toml
 [[routes]]
@@ -136,196 +109,119 @@ zone_name = "yoursite.com"
 
 ## 3. Deploy the Healer
 
-### 3.1 Configure environment
+### Configure
 
 ```bash
 cd healer
 cp .env.example .env
+# CF_ACCOUNT_ID, CF_API_TOKEN, CF_KV_NAMESPACE_ID, HEALER_LISTEN
 ```
 
-```env
-CF_ACCOUNT_ID=your_account_id
-CF_API_TOKEN=your_api_token
-CF_KV_NAMESPACE_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # same as wrangler.toml id
-HEALER_LISTEN=:8080
-```
-
-### 3.2 Option A — local + tunnel (dev / demo)
+### Local + tunnel
 
 ```bash
-cd healer
-go mod tidy
-go run .
-# listens on :8080
-```
-
-Expose publicly:
-
-```bash
-# Cloudflare Tunnel (no account linking required for quick tunnel)
+make healer-run
 cloudflared tunnel --url http://localhost:8080
-# → https://random-name.trycloudflare.com
-
-# or ngrok
-ngrok http 8080
 ```
 
-### 3.3 Option B — Docker
+### Docker Compose
 
 ```bash
-cd healer
-docker build -t autofix-healer .
-docker run -d --name autofix-healer \
-  --env-file .env \
-  -p 8080:8080 \
-  --restart unless-stopped \
-  autofix-healer
+# ensure healer/.env exists
+make compose-up
+curl -s http://127.0.0.1:8080/healthz
 ```
 
-Put a reverse proxy (Caddy, nginx, Traefik) or tunnel in front for TLS.
-
-### 3.4 Option C — any Linux VPS
+### Docker only
 
 ```bash
-cd healer
-go build -o autofix-healer .
+make healer-docker
+docker run -d --name autofix-healer --env-file healer/.env -p 8080:8080 --restart unless-stopped autofix-healer
+```
+
+### systemd (VPS)
+
+```bash
+cd healer && go build -o autofix-healer .
 sudo mv autofix-healer /usr/local/bin/
-
-# systemd unit example
-sudo tee /etc/systemd/system/autofix-healer.service << 'EOF'
-[Unit]
-Description=AutoFix Healer
-After=network.target
-
-[Service]
-EnvironmentFile=/etc/autofix-healer.env
-ExecStart=/usr/local/bin/autofix-healer
-Restart=on-failure
-User=www-data
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl enable --now autofix-healer
+# EnvironmentFile=/etc/autofix-healer.env with CF_* vars
+# ExecStart=/usr/local/bin/autofix-healer
 ```
 
 ---
 
 ## 4. Connect Worker → Healer
 
-The Worker must know the healer’s public URL:
-
 ```bash
 cd edge-worker
 npx wrangler secret put HEALER_DISCOVER_URL
+# https://<healer-host>/v1/discover
 ```
-
-Paste (include path):
-
-```text
-https://<your-healer-host>/v1/discover
-```
-
-Secrets apply without a full redeploy.
 
 ---
 
-## 5. Client runtime (optional)
-
-Serve `client/autofix.js` from your origin or CDN and include:
-
-```html
-<script src="/autofix.js" defer></script>
-```
-
-Shows tooltips on links already rewritten by the Edge (`autofix-healed`).
-
----
-
-## 6. Verification checklist
+## 5. Local development
 
 ```bash
-# Healer alive + circuit state
-curl -s https://<healer-host>/healthz
-# {"status":"ok","wayback_circuit":"closed"}
+# Terminal-friendly one-shot (healer + wrangler)
+chmod +x scripts/dev.sh
+./scripts/dev.sh
+```
 
-# Manual discovery
-curl -s -X POST https://<healer-host>/v1/discover \
+Or separately:
+
+```bash
+cp edge-worker/.dev.vars.example edge-worker/.dev.vars
+make healer-run          # terminal 1
+make edge-dev            # terminal 2
+```
+
+Note: `wrangler dev --remote` does **not** support Queues.
+
+---
+
+## 6. Verification
+
+```bash
+curl -s https://<healer>/healthz
+curl -s -X POST https://<healer>/v1/discover \
   -H 'Content-Type: application/json' \
   -d '{"urls":["https://httpstat.us/404"]}'
-# {"enqueued":1}
-
-# Worker logs
-cd edge-worker && npx wrangler tail
+make edge-tail
 ```
 
-Then load a page **through the Worker** that contains external links. Expect:
-
-1. Worker logs: `Queued N link(s)` or `DISCOVERED`
-2. Healer logs: `verifying …` / `HEALED` / `dead`
-3. Later requests: links with `class="autofix-healed"` and archive `href`
-
-Inspect KV (dashboard → Workers → KV → `AUTOFIX_KV`) for `PENDING` / `HEALED` records.
+Load a page through the Worker with external links → Queue / DISCOVERED logs → healer HEALED/DEAD → later requests rewrite links.
 
 ---
 
-## 7. Local development
-
-```bash
-cd edge-worker
-npx wrangler dev
-# Uses preview_id KV; queues simulated by Miniflare
-# Note: wrangler dev --remote does not support Queues
-```
-
-Point `HEALER_DISCOVER_URL` at `http://127.0.0.1:8080/v1/discover` via `.dev.vars`:
-
-```bash
-# edge-worker/.dev.vars
-HEALER_DISCOVER_URL=http://127.0.0.1:8080/v1/discover
-```
-
-Run healer locally in another terminal.
-
----
-
-## 8. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Likely cause |
 |---------|----------------|
-| Worker deploy fails on KV id | Placeholder `YOUR_KV_NAMESPACE_ID` not replaced |
+| Deploy fails on KV id | Placeholder still in `wrangler.toml` |
 | Deploy fails on DLQ | Create queue or comment out `dead_letter_queue` |
-| No healer traffic | Missing/wrong `HEALER_DISCOVER_URL` secret |
-| `CircuitOpen` in logs | Healer down or slow; wait 30s or fix healer |
-| KV not updating | Healer missing `CF_*` env or wrong namespace id |
-| Links never rewrite | Route not hitting Worker, or not HTML `content-type` |
-| Queue messages stuck | Check consumer in dashboard; `wrangler tail` |
+| No healer traffic | Missing/wrong `HEALER_DISCOVER_URL` |
+| `CircuitOpen` | Healer down; wait or fix healer |
+| KV not updating | Healer `CF_*` / wrong namespace id |
+| CI deploy fails | Missing GitHub secrets or KV ids not in toml |
 
 ---
 
-## 9. Security notes
+## 8. Security
 
-- Prefer **secrets** (`wrangler secret put`) over plain `[vars]` for URLs that should not be public in the Worker script metadata if sensitive.
-- Restrict the healer (firewall / Cloudflare Access) so only Cloudflare egress or your tunnel can reach `/v1/discover`.
-- Rotate the CF API token if leaked; least privilege = KV Edit only.
-- Do not commit `.env` or `.dev.vars` (see `.gitignore`).
+- Use `wrangler secret` for `HEALER_DISCOVER_URL`
+- Restrict healer ingress (tunnel, firewall, Access)
+- KV-only API token for the healer
+- Never commit `.env` / `.dev.vars`
 
 ---
 
 ## Quick reference
 
 ```bash
-# Resources
-npx wrangler kv:namespace create AUTOFIX_KV
-npx wrangler queues create autofix-discovery
-
-# Edge
-cd edge-worker && npx wrangler deploy
+./scripts/setup-cloudflare.sh
+make edge-deploy
+make compose-up   # or make healer-run
 npx wrangler secret put HEALER_DISCOVER_URL
-npx wrangler tail
-
-# Healer
-cd healer && cp .env.example .env && go run .
-# or: docker run --env-file .env -p 8080:8080 autofix-healer
+make edge-tail
 ```

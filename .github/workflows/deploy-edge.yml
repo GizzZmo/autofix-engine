@@ -1,0 +1,43 @@
+name: Deploy Edge Worker
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "edge-worker/**"
+      - ".github/workflows/deploy-edge.yml"
+
+jobs:
+  deploy:
+    name: Deploy to Cloudflare
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: edge-worker
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: edge-worker/package.json
+
+      - run: npm install
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: edge-worker
+          command: deploy
+        # Requires GitHub secrets:
+        #   CLOUDFLARE_API_TOKEN  — Workers edit + account read
+        #   CLOUDFLARE_ACCOUNT_ID
+        # KV ids must already be set in wrangler.toml (committed or via env).
+        # Set HEALER_DISCOVER_URL once via: wrangler secret put (not in CI by default).

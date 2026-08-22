@@ -1,0 +1,18 @@
+services:
+  healer:
+    build:
+      context: ./healer
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    env_file:
+      - ./healer/.env
+    environment:
+      HEALER_LISTEN: ":8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
