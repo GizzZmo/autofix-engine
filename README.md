@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/GizzZmo/autofix-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/GizzZmo/autofix-engine/actions/workflows/ci.yml)
 [![Deploy Edge](https://github.com/GizzZmo/autofix-engine/actions/workflows/deploy-edge.yml/badge.svg)](https://github.com/GizzZmo/autofix-engine/actions/workflows/deploy-edge.yml)
+[![Coverage](https://img.shields.io/badge/coverage-17.6%25-yellow)](https://github.com/GizzZmo/autofix-engine/actions/workflows/ci.yml)
+[![Codecov](https://codecov.io/gh/GizzZmo/autofix-engine/branch/main/graph/badge.svg)](https://codecov.io/gh/GizzZmo/autofix-engine)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178C6?logo=typescript&logoColor=white)](./edge-worker)
 [![Go](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go&logoColor=white)](./healer)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
@@ -37,6 +39,7 @@ Browser → Worker (HTMLRewriter + KV + Queue + circuit breaker)
 | Edge Worker | TypeScript · ~9.4 KB (~270 LOC) |
 | Go Healer | main + circuit breaker · ~14 KB (~420 LOC) |
 | Healer tests | ~1 KB (~30 LOC) |
+| **Go coverage** | **17.6%** statements (circuit breaker ~90%+) |
 | Client runtime | `autofix.js` · ~1.7 KB (~50 LOC) |
 | CI / deploy workflows | 2 · path-filtered jobs |
 | Stack | Cloudflare Workers · KV · Queues · Go · Node 22 |
@@ -81,7 +84,7 @@ Local full stack: `./scripts/dev.sh` (healer + `wrangler dev`).
 | `make edge-tail` | Live logs |
 | `make healer-run` | Run Go healer |
 | `make compose-up` | Docker Compose healer |
-| `make ci` | Typecheck + build/vet |
+| `make ci` | Typecheck + build/vet/coverage |
 
 ---
 
@@ -117,8 +120,10 @@ autofix-engine/
 
 | Workflow | Trigger | Checks |
 |----------|---------|--------|
-| [**CI**](https://github.com/GizzZmo/autofix-engine/actions/workflows/ci.yml) | push / PR to `main` | Path filters → Edge (`npm ci` + `tsc`) · Healer (`go build` / `vet` / `test`) · ci-gate |
+| [**CI**](https://github.com/GizzZmo/autofix-engine/actions/workflows/ci.yml) | push / PR to `main` | Path filters → Edge (`npm ci` + `tsc`) · Healer (`go build` / `vet` / `test` + **coverage**) · ci-gate |
 | [**Deploy Edge**](https://github.com/GizzZmo/autofix-engine/actions/workflows/deploy-edge.yml) | push to `main` (edge paths) or manual | Expand lockfile → `npm ci` → KV id guard → Wrangler deploy |
+
+**Coverage:** `go test -coverprofile=coverage.out` on the healer package. Artifact `healer-coverage` is uploaded; optional [Codecov](https://codecov.io/gh/GizzZmo/autofix-engine) upload when `CODECOV_TOKEN` is set.
 
 **Secrets for deploy:** `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`
 
