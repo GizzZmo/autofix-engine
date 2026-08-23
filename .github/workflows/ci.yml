@@ -40,6 +40,11 @@ jobs:
         working-directory: edge-worker
     steps:
       - uses: actions/checkout@v4
+      - name: Expand package-lock.json
+        working-directory: .
+        run: |
+          chmod +x scripts/expand-lockfile.sh
+          ./scripts/expand-lockfile.sh
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
