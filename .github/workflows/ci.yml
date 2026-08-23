@@ -7,8 +7,33 @@ on:
     branches: [main]
 
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      edge: ${{ steps.filter.outputs.edge }}
+      healer: ${{ steps.filter.outputs.healer }}
+      shared: ${{ steps.filter.outputs.shared }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            edge:
+              - 'edge-worker/**'
+            healer:
+              - 'healer/**'
+            shared:
+              - '.github/workflows/ci.yml'
+              - 'Makefile'
+              - 'scripts/**'
+              - 'docker-compose.yml'
+
   edge-worker:
     name: Edge Worker (TypeScript)
+    needs: changes
+    if: needs.changes.outputs.edge == 'true' || needs.changes.outputs.shared == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -26,6 +51,8 @@ jobs:
 
   healer:
     name: Healer (Go)
+    needs: changes
+    if: needs.changes.outputs.healer == 'true' || needs.changes.outputs.shared == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -48,3 +75,40 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test ./...
+
+  # Succeeds when only docs/client changed so required checks can still pass.
+  ci-gate:
+    name: CI gate
+    needs: [changes, edge-worker, healer]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate results
+        run: |
+          edge="${{ needs.changes.outputs.edge }}"
+          healer="${{ needs.changes.outputs.healer }}"
+          shared="${{ needs.changes.outputs.shared }}"
+          edge_result="${{ needs.edge-worker.result }}"
+          healer_result="${{ needs.healer.result }}"
+
+          echo "edge=$edge healer=$healer shared=$shared"
+          echo "edge_result=$edge_result healer_result=$healer_result"
+
+          fail=0
+          if [[ "$edge" == "true" || "$shared" == "true" ]]; then
+            if [[ "$edge_result" != "success" ]]; then
+              echo "Edge worker job failed or was skipped unexpectedly"
+              fail=1
+            fi
+          fi
+          if [[ "$healer" == "true" || "$shared" == "true" ]]; then
+            if [[ "$healer_result" != "success" ]]; then
+              echo "Healer job failed or was skipped unexpectedly"
+              fail=1
+            fi
+          fi
+
+          if [[ "$fail" -ne 0 ]]; then
+            exit 1
+          fi
+          echo "CI gate passed"
