@@ -78,8 +78,30 @@ jobs:
         run: go build -o autofix-healer .
       - name: Vet
         run: go vet ./...
-      - name: Test
-        run: go test ./...
+      - name: Test with coverage
+        run: |
+          go test -coverprofile=coverage.out -covermode=atomic ./...
+          go tool cover -func=coverage.out | tee coverage.txt
+          TOTAL=$(go tool cover -func=coverage.out | awk '/total:/ {print $3}')
+          echo "Total coverage: $TOTAL"
+          echo "coverage=$TOTAL" >> "$GITHUB_OUTPUT"
+        id: cov
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: healer-coverage
+          path: |
+            healer/coverage.out
+            healer/coverage.txt
+          if-no-files-found: warn
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: healer/coverage.out
+          flags: healer
+          name: healer-go
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   ci-gate:
     name: CI gate
