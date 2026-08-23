@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"testing"
+
+	"github.com/GizzZmo/autofix-engine/healer/types"
 )
 
 // HTML snippets for soft-404 heuristic benchmarks.
@@ -48,7 +50,7 @@ func BenchmarkKeyFor(b *testing.B) {
 	url := "https://example.com/path/to/resource?q=1&x=2"
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = keyFor(url)
+		_ = types.KeyFor(url)
 	}
 }
 
