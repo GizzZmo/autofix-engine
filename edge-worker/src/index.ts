@@ -2,41 +2,17 @@
 // + Cloudflare Queue producer/consumer + circuit breaker for healer
 //
 // Contracts: https://github.com/GizzZmo/autofix-polyglot
+// Types: ./types (synced from polyglot types/typescript)
+
+import type { LinkRecord, DiscoveryMessage } from "./types";
+import { urlKey } from "./types";
+import { logEvent, newTraceparent } from "./telemetry";
 
 export interface Env {
   AUTOFIX_KV: KVNamespace;
   DISCOVERY_QUEUE?: Queue<DiscoveryMessage>;
   HEALER_DISCOVER_URL?: string;
   ENVIRONMENT?: string;
-}
-
-interface LinkRecord {
-  status: "PENDING" | "HEALED" | "DEAD" | "HEALTHY";
-  original_url: string;
-  resolved_url?: string;
-  discovered_at?: string;
-  healed_at?: string;
-  reason?: string;
-}
-
-interface DiscoveryMessage {
-  urls: string[];
-  discovered_at: string;
-}
-
-/**
- * Canonical KV key for an absolute URL.
- * Must match Go base64.StdEncoding.EncodeToString([]byte(url))
- * and polyglot types/typescript/link-record.ts urlKey().
- * See ADR-004 in autofix-polyglot.
- */
-function urlKey(url: string): string {
-  const bytes = new TextEncoder().encode(url);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]!);
-  }
-  return btoa(binary);
 }
 
 /** HTMLRewriter Element has no classList — append a class token safely. */
@@ -101,9 +77,17 @@ class CircuitBreaker {
   }
 
   private onSuccess() {
+    const wasOpen = this.state === "open" || this.state === "half_open";
     this.failures = 0;
     this.state = "closed";
     this.halfOpenInFlight = 0;
+    if (wasOpen) {
+      logEvent({
+        event: "circuit.close",
+        circuit: "closed",
+        circuit_name: "edge_healer",
+      });
+    }
   }
 
   private onFailure() {
@@ -112,9 +96,14 @@ class CircuitBreaker {
       this.state = "open";
       this.openedAt = Date.now();
       this.halfOpenInFlight = 0;
-      console.warn(
-        `Circuit breaker OPEN after ${this.failures} failure(s); cooling ${this.openMs}ms`
-      );
+      logEvent({
+        event: "circuit.open",
+        level: "warn",
+        circuit: "open",
+        circuit_name: "edge_healer",
+        count: this.failures,
+        duration_ms: this.openMs,
+      });
     }
   }
 }
@@ -178,6 +167,14 @@ const worker = {
                 element.setAttribute("data-autofix-original", absolute);
                 element.setAttribute("rel", "nofollow archived");
                 addClass(element, "autofix-healed");
+                logEvent({
+                  event: "link.rewrite",
+                  level: "debug",
+                  url: absolute,
+                  url_key: key,
+                  status: "HEALED",
+                  resolved_url: cached.resolved_url,
+                });
               } else if (!cached) {
                 discovered.add(absolute);
               }
@@ -191,14 +188,23 @@ const worker = {
       if (discovered.size > 0) {
         ctx.waitUntil(
           reportDiscoveries(env, Array.from(discovered)).catch((err) => {
-            console.error("reportDiscoveries failed:", err);
+            logEvent({
+              event: "link.discover",
+              level: "error",
+              error: err instanceof Error ? err.message : String(err),
+              count: discovered.size,
+            });
           })
         );
       }
 
       return transformed;
     } catch (err) {
-      console.error("HTMLRewriter failed, returning original:", err);
+      logEvent({
+        event: "link.rewrite",
+        level: "error",
+        error: err instanceof Error ? err.message : String(err),
+      });
       return response;
     }
   },
@@ -213,7 +219,12 @@ const worker = {
         const urls = msg.body?.urls;
 
         if (!Array.isArray(urls) || urls.length === 0) {
-          console.warn(`Invalid message body, acking id=${msg.id}`);
+          logEvent({
+            event: "queue.consume",
+            level: "warn",
+            msg_id: msg.id,
+            error: "invalid_body",
+          });
           msg.ack();
           continue;
         }
@@ -227,14 +238,27 @@ const worker = {
         }
 
         await forwardToHealer(env, unique);
+        logEvent({
+          event: "queue.consume",
+          msg_id: msg.id,
+          count: unique.length,
+        });
         msg.ack();
       } catch (err) {
         const attempts = msg.attempts ?? 0;
         const message = err instanceof Error ? err.message : String(err);
-        console.error(`Message ${msg.id} failed (attempt ${attempts}):`, message);
-
         const base = message === "CircuitOpen" ? 120 : 60;
         const delaySeconds = Math.min(base * 2 ** attempts, 3600);
+        logEvent({
+          event: "queue.retry",
+          level: "error",
+          msg_id: msg.id,
+          attempt: attempts,
+          error: message,
+          duration_ms: delaySeconds * 1000,
+          circuit: healerBreaker.status,
+          circuit_name: "edge_healer",
+        });
         msg.retry({ delaySeconds });
       }
     }
@@ -248,12 +272,24 @@ async function forwardToHealer(env: Env, urls: string[]): Promise<void> {
     throw new Error("HEALER_DISCOVER_URL not configured");
   }
 
+  const { traceparent, traceId } = newTraceparent();
+  const t0 = Date.now();
+
   await healerBreaker.exec(async () => {
-    console.log(`Forwarding ${urls.length} url(s) to healer`);
+    logEvent({
+      event: "healer.forward",
+      count: urls.length,
+      trace_id: traceId,
+      circuit: healerBreaker.status,
+      circuit_name: "edge_healer",
+    });
 
     const res = await fetch(env.HEALER_DISCOVER_URL!, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        traceparent,
+      },
       body: JSON.stringify({ urls }),
       signal: AbortSignal.timeout(15_000),
     });
@@ -262,33 +298,40 @@ async function forwardToHealer(env: Env, urls: string[]): Promise<void> {
       const text = await res.text().catch(() => "");
       throw new Error(`Healer ${res.status}: ${text.slice(0, 200)}`);
     }
+
+    logEvent({
+      event: "healer.forward",
+      level: "debug",
+      count: urls.length,
+      duration_ms: Date.now() - t0,
+      trace_id: traceId,
+    });
   });
 }
 
 async function fallbackHttp(env: Env, urls: string[]): Promise<void> {
   if (!env.HEALER_DISCOVER_URL) return;
   try {
-    await healerBreaker.exec(async () => {
-      const res = await fetch(env.HEALER_DISCOVER_URL!, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ urls }),
-        signal: AbortSignal.timeout(15_000),
-      });
-      if (!res.ok) {
-        throw new Error(`Healer HTTP ${res.status}`);
-      }
+    await forwardToHealer(env, urls);
+    logEvent({
+      event: "queue.fallback_http",
+      count: urls.length,
     });
   } catch (err) {
-    console.error(
-      "HTTP fallback failed:",
-      err instanceof Error ? err.message : err
-    );
+    logEvent({
+      event: "queue.fallback_http",
+      level: "error",
+      count: urls.length,
+      error: err instanceof Error ? err.message : String(err),
+      circuit: healerBreaker.status,
+      circuit_name: "edge_healer",
+    });
   }
 }
 
 async function reportDiscoveries(env: Env, urls: string[]): Promise<void> {
   const now = new Date().toISOString();
+  const t0 = Date.now();
 
   if (env.AUTOFIX_KV) {
     await Promise.all(
@@ -304,7 +347,12 @@ async function reportDiscoveries(env: Env, urls: string[]): Promise<void> {
           };
           await env.AUTOFIX_KV.put(key, JSON.stringify(record));
         } catch (err) {
-          console.error("KV put failed for", url, err);
+          logEvent({
+            event: "link.discover",
+            level: "error",
+            url,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
       })
     );
@@ -314,16 +362,33 @@ async function reportDiscoveries(env: Env, urls: string[]): Promise<void> {
     try {
       const message: DiscoveryMessage = { urls, discovered_at: now };
       await env.DISCOVERY_QUEUE.send(message);
-      console.log(`Queued ${urls.length} link(s) on DISCOVERY_QUEUE`);
+      logEvent({
+        event: "queue.send",
+        count: urls.length,
+        duration_ms: Date.now() - t0,
+      });
+      logEvent({
+        event: "link.discover",
+        count: urls.length,
+        status: "PENDING",
+        duration_ms: Date.now() - t0,
+      });
       return;
     } catch (err) {
-      console.error(
-        "Queue send failed, falling back to HTTP:",
-        err instanceof Error ? err.message : err
-      );
+      logEvent({
+        event: "queue.send",
+        level: "error",
+        count: urls.length,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
   await fallbackHttp(env, urls);
-  console.log(`DISCOVERED ${urls.length} new link(s)`);
+  logEvent({
+    event: "link.discover",
+    count: urls.length,
+    status: "PENDING",
+    duration_ms: Date.now() - t0,
+  });
 }
