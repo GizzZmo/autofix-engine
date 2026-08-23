@@ -1,0 +1,56 @@
+name: Deploy Edge Worker
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "edge-worker/**"
+      - ".github/workflows/deploy-edge.yml"
+
+jobs:
+  deploy:
+    name: Deploy to Cloudflare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: edge-worker/package-lock.json
+
+      - name: Install dependencies
+        working-directory: edge-worker
+        run: npm ci
+
+      - name: Type-check
+        working-directory: edge-worker
+        run: npx tsc --noEmit
+
+      - name: Validate KV namespace ids
+        run: |
+          chmod +x scripts/check-wrangler-kv.sh
+          ./scripts/check-wrangler-kv.sh edge-worker/wrangler.toml
+
+      - name: Check secrets
+        run: |
+          if [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]; then
+            echo "::error::Missing secret CLOUDFLARE_API_TOKEN"
+            exit 1
+          fi
+          if [ -z "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ]; then
+            echo "::error::Missing secret CLOUDFLARE_ACCOUNT_ID"
+            exit 1
+          fi
+
+      - name: Deploy with Wrangler
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: edge-worker
+          packageManager: npm
+          wranglerVersion: "3.114.0"
+          command: deploy
