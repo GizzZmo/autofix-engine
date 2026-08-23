@@ -15,6 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Expand package-lock.json
+        run: |
+          chmod +x scripts/expand-lockfile.sh
+          ./scripts/expand-lockfile.sh
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
