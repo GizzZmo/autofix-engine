@@ -44,8 +44,8 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: edge-worker/package.json
-      - run: npm install
+          cache-dependency-path: edge-worker/package-lock.json
+      - run: npm ci
       - name: Type-check
         run: npx tsc --noEmit
 

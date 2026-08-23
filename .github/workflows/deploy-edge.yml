@@ -26,11 +26,11 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: edge-worker/package.json
+          cache-dependency-path: edge-worker/package-lock.json
 
       - name: Install dependencies
         working-directory: edge-worker
-        run: npm install
+        run: npm ci
 
       - name: Type-check
         working-directory: edge-worker
