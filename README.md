@@ -83,8 +83,33 @@ Local full stack: `./scripts/dev.sh` (healer + `wrangler dev`).
 | `make edge-deploy` | Deploy Worker |
 | `make edge-tail` | Live logs |
 | `make healer-run` | Run Go healer |
+| `make healer-test` | Unit tests + coverage |
+| `make healer-bench` | CPU benchmarks (`-count=3`) → `healer/bench.txt` |
+| `make healer-bench-cpu` | CPU profile → `healer/cpu.prof` |
+| `make healer-bench-mem` | Memory profile → `healer/mem.prof` |
+| `make healer-benchstat OLD=a.txt NEW=b.txt` | Compare with [benchstat](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat) |
 | `make compose-up` | Docker Compose healer |
-| `make ci` | Typecheck + build/vet/coverage |
+| `make ci` | Typecheck + build/vet/test/short-bench |
+
+### Benchmarks (healer)
+
+```bash
+make healer-bench
+# or:
+cd healer && go test -run=^$ -bench=. -benchmem -count=3 ./...
+
+# Profiles
+make healer-bench-cpu   # go tool pprof healer/cpu.prof
+make healer-bench-mem   # go tool pprof healer/mem.prof
+
+# Before/after comparison
+make healer-bench && cp healer/bench.txt old.txt
+# ... change code ...
+make healer-bench && cp healer/bench.txt new.txt
+make healer-benchstat OLD=old.txt NEW=new.txt
+```
+
+Hot paths covered: circuit breaker (success / fail / open / parallel), soft-404 heuristics, discovery queue enqueue, KV `keyFor`.
 
 ---
 
@@ -105,7 +130,7 @@ Local full stack: `./scripts/dev.sh` (healer + `wrangler dev`).
 ```
 autofix-engine/
 ├── edge-worker/          # Cloudflare Worker
-├── healer/               # Go healer + circuit breaker
+├── healer/               # Go healer + circuit breaker + benches
 ├── client/autofix.js
 ├── scripts/              # setup-cloudflare.sh, expand-lockfile, dev.sh
 ├── docker-compose.yml
@@ -120,10 +145,12 @@ autofix-engine/
 
 | Workflow | Trigger | Checks |
 |----------|---------|--------|
-| [**CI**](https://github.com/GizzZmo/autofix-engine/actions/workflows/ci.yml) | push / PR to `main` | Path filters → Edge (`npm ci` + `tsc`) · Healer (`go build` / `vet` / `test` + **coverage**) · ci-gate |
+| [**CI**](https://github.com/GizzZmo/autofix-engine/actions/workflows/ci.yml) | push / PR to `main` | Path filters → Edge (`npm ci` + `tsc`) · Healer (`go build` / `vet` / `test` + **coverage** + **short benches**) · ci-gate |
 | [**Deploy Edge**](https://github.com/GizzZmo/autofix-engine/actions/workflows/deploy-edge.yml) | push to `main` (edge paths) or manual | Expand lockfile → `npm ci` → KV id guard → Wrangler deploy |
 
-**Coverage:** `go test -coverprofile=coverage.out` on the healer package. Artifact `healer-coverage` is uploaded; optional [Codecov](https://codecov.io/gh/GizzZmo/autofix-engine) upload when `CODECOV_TOKEN` is set.
+**Coverage:** `go test -coverprofile=coverage.out` · artifact `healer-coverage` · optional [Codecov](https://codecov.io/gh/GizzZmo/autofix-engine) when `CODECOV_TOKEN` is set.
+
+**Benchmarks:** CI runs `-benchtime=100ms` and uploads artifact `healer-bench` (`bench.txt`). Local: `make healer-bench`.
 
 **Secrets for deploy:** `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`
 
