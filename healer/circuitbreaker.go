@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,10 +25,13 @@ type CircuitBreaker struct {
 	failures         int
 	openedAt         time.Time
 	halfOpenInFlight int
+	trips            atomic.Int64
 
 	failureThreshold int
 	openDuration     time.Duration
 	halfOpenMax      int
+
+	onTrip func() // optional hook (e.g. metric)
 }
 
 func NewCircuitBreaker(failureThreshold int, openDuration time.Duration, halfOpenMax int) *CircuitBreaker {
@@ -95,6 +99,10 @@ func (cb *CircuitBreaker) after(err error) {
 		cb.state = stateOpen
 		cb.openedAt = time.Now()
 		cb.halfOpenInFlight = 0
+		cb.trips.Add(1)
+		if cb.onTrip != nil {
+			cb.onTrip()
+		}
 	}
 }
 
@@ -114,3 +122,6 @@ func (cb *CircuitBreaker) State() string {
 		return "closed"
 	}
 }
+
+// Trips returns how many times the breaker opened.
+func (cb *CircuitBreaker) Trips() int64 { return cb.trips.Load() }
