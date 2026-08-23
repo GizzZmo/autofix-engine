@@ -1,5 +1,7 @@
 // The Edge Layer: High-performance HTML streaming rewriter
 // + Cloudflare Queue producer/consumer + circuit breaker for healer
+//
+// Contracts: https://github.com/GizzZmo/autofix-polyglot
 
 export interface Env {
   AUTOFIX_KV: KVNamespace;
@@ -22,13 +24,19 @@ interface DiscoveryMessage {
   discovered_at: string;
 }
 
-/** Safe base64 key for arbitrary URLs (handles Unicode). */
+/**
+ * Canonical KV key for an absolute URL.
+ * Must match Go base64.StdEncoding.EncodeToString([]byte(url))
+ * and polyglot types/typescript/link-record.ts urlKey().
+ * See ADR-004 in autofix-polyglot.
+ */
 function urlKey(url: string): string {
-  try {
-    return btoa(unescape(encodeURIComponent(url)));
-  } catch {
-    return encodeURIComponent(url).slice(0, 512);
+  const bytes = new TextEncoder().encode(url);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]!);
   }
+  return btoa(binary);
 }
 
 /** HTMLRewriter Element has no classList — append a class token safely. */
