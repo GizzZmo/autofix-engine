@@ -30,7 +30,13 @@ jobs:
 
       - name: Install dependencies
         working-directory: edge-worker
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ] && grep -q '"node_modules/' package-lock.json; then
+            npm ci
+          else
+            echo "Complete package-lock.json not found; using npm install"
+            npm install
+          fi
 
       - name: Type-check
         working-directory: edge-worker
