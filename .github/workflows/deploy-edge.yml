@@ -8,19 +8,17 @@ on:
       - "edge-worker/**"
       - ".github/workflows/deploy-edge.yml"
 
-# Required GitHub Actions secrets:
-#   CLOUDFLARE_API_TOKEN   — Account → Workers Scripts Edit (+ Queues/KV as needed)
-#   CLOUDFLARE_ACCOUNT_ID  — Cloudflare account id
-#
-# wrangler.toml must use real 32-char hex KV namespace ids (not YOUR_KV_* placeholders).
-# HEALER_DISCOVER_URL is set once via: npx wrangler secret put HEALER_DISCOVER_URL
-
 jobs:
   deploy:
     name: Deploy to Cloudflare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Expand package-lock.json
+        run: |
+          chmod +x scripts/expand-lockfile.sh
+          ./scripts/expand-lockfile.sh
 
       - uses: actions/setup-node@v4
         with:
@@ -30,13 +28,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: edge-worker
-        run: |
-          if [ -f package-lock.json ] && grep -q '"node_modules/' package-lock.json; then
-            npm ci
-          else
-            echo "Complete package-lock.json not found; using npm install"
-            npm install
-          fi
+        run: npm ci
 
       - name: Type-check
         working-directory: edge-worker

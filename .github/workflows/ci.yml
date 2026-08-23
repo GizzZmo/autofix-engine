@@ -40,19 +40,17 @@ jobs:
         working-directory: edge-worker
     steps:
       - uses: actions/checkout@v4
+      - name: Expand package-lock.json
+        working-directory: .
+        run: |
+          chmod +x scripts/expand-lockfile.sh
+          ./scripts/expand-lockfile.sh
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: edge-worker/package-lock.json
-      - name: Install dependencies
-        run: |
-          if [ -f package-lock.json ] && grep -q '"node_modules/' package-lock.json; then
-            npm ci
-          else
-            echo "Complete package-lock.json not found; using npm install"
-            npm install
-          fi
+      - run: npm ci
       - name: Type-check
         run: npx tsc --noEmit
 
