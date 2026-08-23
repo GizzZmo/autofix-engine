@@ -3,11 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/GizzZmo/autofix-engine/healer/types"
 	"github.com/joho/godotenv"
 )
 
@@ -54,19 +54,6 @@ func envOr(key, fallback string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Link record
-// ---------------------------------------------------------------------------
-
-type LinkRecord struct {
-	Status       string `json:"status"`
-	OriginalURL  string `json:"original_url"`
-	ResolvedURL  string `json:"resolved_url,omitempty"`
-	DiscoveredAt string `json:"discovered_at,omitempty"`
-	HealedAt     string `json:"healed_at,omitempty"`
-	Reason       string `json:"reason,omitempty"`
-}
-
-// ---------------------------------------------------------------------------
 // Discovery queue
 // ---------------------------------------------------------------------------
 
@@ -93,11 +80,18 @@ func (q *DiscoveryQueue) Enqueue(url string) {
 	select {
 	case q.ch <- url:
 	default:
-		log.Printf("queue full, dropping: %s", url)
+		logEvent(context.Background(), slog.LevelWarn, "heal.defer",
+			"url", url,
+			"reason", "queue_full",
+		)
 	}
 }
 
 func (q *DiscoveryQueue) Chan() <-chan string { return q.ch }
+
+func (q *DiscoveryQueue) Depth() int64 {
+	return int64(len(q.ch))
+}
 
 // ---------------------------------------------------------------------------
 // Wayback Machine (protected by circuit breaker)
@@ -114,11 +108,12 @@ type ArchiveResponse struct {
 
 var waybackBreaker = NewCircuitBreaker(5, 60*time.Second, 1)
 
-func CheckArchive(client *http.Client, url string) (string, error) {
+func CheckArchive(ctx context.Context, client *http.Client, url string) (string, error) {
 	var result string
+	t0 := time.Now()
 	err := waybackBreaker.Execute(func() error {
 		apiURL := fmt.Sprintf("https://archive.org/wayback/available?url=%s", url)
-		req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 		if err != nil {
 			return err
 		}
@@ -145,12 +140,31 @@ func CheckArchive(client *http.Client, url string) (string, error) {
 		// "no archive" is not a dependency failure — do not trip the breaker
 		return nil
 	})
+	dur := time.Since(t0).Milliseconds()
 	if err != nil {
+		logEvent(ctx, slog.LevelWarn, "heal.archive",
+			"url", url,
+			"error", err.Error(),
+			"duration_ms", dur,
+			"circuit", waybackBreaker.State(),
+			"circuit_name", "healer_wayback",
+		)
 		return "", err
 	}
 	if result == "" {
+		logEvent(ctx, slog.LevelInfo, "heal.archive",
+			"url", url,
+			"reason", "miss",
+			"duration_ms", dur,
+		)
 		return "", fmt.Errorf("no archive found")
 	}
+	logEvent(ctx, slog.LevelInfo, "heal.archive",
+		"url", url,
+		"resolved_url", result,
+		"reason", "hit",
+		"duration_ms", dur,
+	)
 	return result, nil
 }
 
@@ -186,24 +200,29 @@ func looksLikeSoft404(body []byte, contentType string) bool {
 	return soft404BodyRe.MatchString(snippet)
 }
 
-func CheckLink(client *http.Client, url string) (bool, string) {
-	req, err := http.NewRequest(http.MethodHead, url, nil)
+func CheckLink(ctx context.Context, client *http.Client, url string) (bool, string) {
+	t0 := time.Now()
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 	if err != nil {
+		logEvent(ctx, slog.LevelInfo, "heal.check", "url", url, "reason", "invalid_url", "duration_ms", time.Since(t0).Milliseconds())
 		return true, "invalid_url"
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; AutoFix-Healer/1.0)")
 
 	resp, err := client.Do(req)
 	if err != nil {
+		logEvent(ctx, slog.LevelInfo, "heal.check", "url", url, "reason", "network_error", "duration_ms", time.Since(t0).Milliseconds())
 		return true, "network_error"
 	}
 	resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return true, fmt.Sprintf("http_%d", resp.StatusCode)
+		reason := fmt.Sprintf("http_%d", resp.StatusCode)
+		logEvent(ctx, slog.LevelInfo, "heal.check", "url", url, "reason", reason, "duration_ms", time.Since(t0).Milliseconds())
+		return true, reason
 	}
 
-	req2, err := http.NewRequest(http.MethodGet, url, nil)
+	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false, ""
 	}
@@ -217,13 +236,17 @@ func CheckLink(client *http.Client, url string) (bool, string) {
 	defer resp2.Body.Close()
 
 	if resp2.StatusCode >= 400 {
-		return true, fmt.Sprintf("http_%d", resp2.StatusCode)
+		reason := fmt.Sprintf("http_%d", resp2.StatusCode)
+		logEvent(ctx, slog.LevelInfo, "heal.check", "url", url, "reason", reason, "duration_ms", time.Since(t0).Milliseconds())
+		return true, reason
 	}
 
 	body, _ := io.ReadAll(io.LimitReader(resp2.Body, 8192))
 	if looksLikeSoft404(body, resp2.Header.Get("Content-Type")) {
+		logEvent(ctx, slog.LevelInfo, "heal.check", "url", url, "reason", "soft_404", "duration_ms", time.Since(t0).Milliseconds())
 		return true, "soft_404"
 	}
+	logEvent(ctx, slog.LevelDebug, "heal.check", "url", url, "status", types.StatusHealthy, "duration_ms", time.Since(t0).Milliseconds())
 	return false, ""
 }
 
@@ -238,7 +261,7 @@ type CloudflareKV struct {
 	Client      *http.Client
 }
 
-func (c *CloudflareKV) Put(key string, record LinkRecord) error {
+func (c *CloudflareKV) Put(ctx context.Context, key string, record types.LinkRecord) error {
 	if c.AccountID == "" || c.NamespaceID == "" || c.Token == "" {
 		return fmt.Errorf("Cloudflare credentials not configured")
 	}
@@ -253,7 +276,7 @@ func (c *CloudflareKV) Put(key string, record LinkRecord) error {
 		c.AccountID, c.NamespaceID, key,
 	)
 
-	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -273,10 +296,6 @@ func (c *CloudflareKV) Put(key string, record LinkRecord) error {
 	return nil
 }
 
-func keyFor(url string) string {
-	return base64.StdEncoding.EncodeToString([]byte(url))
-}
-
 // ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
@@ -284,52 +303,82 @@ func keyFor(url string) string {
 func runWorker(id int, q *DiscoveryQueue, kv *CloudflareKV, client *http.Client, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for url := range q.Chan() {
-		log.Printf("[worker-%d] verifying %s", id, url)
+		ctx := context.Background()
+		t0 := time.Now()
 
-		dead, reason := CheckLink(client, url)
+		dead, reason := CheckLink(ctx, client, url)
 		if !dead {
-			log.Printf("[worker-%d] healthy: %s", id, url)
-			_ = kv.Put(keyFor(url), LinkRecord{
-				Status:      "HEALTHY",
+			rec := types.LinkRecord{
+				Status:      types.StatusHealthy,
 				OriginalURL: url,
 				HealedAt:    time.Now().UTC().Format(time.RFC3339),
-			})
+			}
+			if err := kv.Put(ctx, types.KeyFor(url), rec); err != nil {
+				logEvent(ctx, slog.LevelError, "heal.write",
+					"url", url, "status", types.StatusHealthy, "error", err.Error(),
+				)
+			} else {
+				logEvent(ctx, slog.LevelInfo, "heal.write",
+					"url", url, "url_key", types.KeyFor(url), "status", types.StatusHealthy,
+					"duration_ms", time.Since(t0).Milliseconds(),
+				)
+			}
 			continue
 		}
 
-		log.Printf("[worker-%d] dead (%s) — searching archive for %s", id, reason, url)
-		healed, err := CheckArchive(client, url)
+		healed, err := CheckArchive(ctx, client, url)
 		if err != nil {
 			if err == ErrCircuitOpen {
-				log.Printf("[worker-%d] wayback circuit open — deferring %s", id, url)
-				_ = kv.Put(keyFor(url), LinkRecord{
-					Status:      "PENDING",
+				rec := types.LinkRecord{
+					Status:      types.StatusPending,
 					OriginalURL: url,
 					HealedAt:    time.Now().UTC().Format(time.RFC3339),
 					Reason:      "circuit_open",
-				})
+				}
+				_ = kv.Put(ctx, types.KeyFor(url), rec)
+				logEvent(ctx, slog.LevelWarn, "heal.defer",
+					"url", url,
+					"reason", "circuit_open",
+					"circuit", waybackBreaker.State(),
+					"circuit_name", "healer_wayback",
+					"duration_ms", time.Since(t0).Milliseconds(),
+				)
 				continue
 			}
-			log.Printf("[worker-%d] no archive: %v", id, err)
-			_ = kv.Put(keyFor(url), LinkRecord{
-				Status:      "DEAD",
+			rec := types.LinkRecord{
+				Status:      types.StatusDead,
 				OriginalURL: url,
 				HealedAt:    time.Now().UTC().Format(time.RFC3339),
 				Reason:      reason,
-			})
+			}
+			_ = kv.Put(ctx, types.KeyFor(url), rec)
+			logEvent(ctx, slog.LevelInfo, "heal.write",
+				"url", url, "status", types.StatusDead, "reason", reason,
+				"duration_ms", time.Since(t0).Milliseconds(),
+			)
 			continue
 		}
 
-		log.Printf("[worker-%d] HEALED %s → %s", id, url, healed)
-		err = kv.Put(keyFor(url), LinkRecord{
-			Status:      "HEALED",
+		rec := types.LinkRecord{
+			Status:      types.StatusHealed,
 			OriginalURL: url,
 			ResolvedURL: healed,
 			HealedAt:    time.Now().UTC().Format(time.RFC3339),
 			Reason:      reason,
-		})
-		if err != nil {
-			log.Printf("[worker-%d] failed to write KV: %v", id, err)
+		}
+		if err := kv.Put(ctx, types.KeyFor(url), rec); err != nil {
+			logEvent(ctx, slog.LevelError, "heal.write",
+				"url", url, "status", types.StatusHealed, "error", err.Error(),
+			)
+		} else {
+			logEvent(ctx, slog.LevelInfo, "heal.write",
+				"url", url,
+				"url_key", types.KeyFor(url),
+				"status", types.StatusHealed,
+				"reason", reason,
+				"resolved_url", healed,
+				"duration_ms", time.Since(t0).Milliseconds(),
+			)
 		}
 	}
 }
@@ -338,17 +387,12 @@ func runWorker(id int, q *DiscoveryQueue, kv *CloudflareKV, client *http.Client,
 // HTTP API
 // ---------------------------------------------------------------------------
 
-type discoverRequest struct {
-	URLs []string `json:"urls"`
-	URL  string   `json:"url"`
-}
-
 func startHTTPServer(addr string, q *DiscoveryQueue) *http.Server {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
+		_ = json.NewEncoder(w).Encode(map[string]string{
 			"status":          "ok",
 			"wayback_circuit": waybackBreaker.State(),
 		})
@@ -359,7 +403,7 @@ func startHTTPServer(addr string, q *DiscoveryQueue) *http.Server {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
-		var req discoverRequest
+		var req types.DiscoverRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
@@ -375,26 +419,42 @@ func startHTTPServer(addr string, q *DiscoveryQueue) *http.Server {
 			q.Enqueue(req.URL)
 			count++
 		}
+		logEvent(r.Context(), slog.LevelInfo, "heal.check",
+			"event_note", "discover_enqueued",
+			"count", count,
+		)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"enqueued": count})
+		_ = json.NewEncoder(w).Encode(types.DiscoverResponse{Enqueued: count})
 	})
 
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
-		log.Printf("discovery API listening on %s", addr)
+		logEvent(context.Background(), slog.LevelInfo, "heal.check",
+			"event_note", "http_listen",
+			"reason", addr,
+		)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http server error: %v", err)
+			logEvent(context.Background(), slog.LevelError, "heal.check",
+				"error", err.Error(),
+			)
+			os.Exit(1)
 		}
 	}()
 	return srv
 }
 
 func main() {
+	setupSlog()
 	cfg := loadConfig()
-	log.Println("🚀 AutoFix Healer Engine starting...")
+	logEvent(context.Background(), slog.LevelInfo, "heal.check",
+		"event_note", "startup",
+		"component", "healer",
+	)
 
 	if cfg.CFAccountID == "" || cfg.CFAPIToken == "" || cfg.CFKVNamespaceID == "" {
-		log.Println("⚠️  Cloudflare credentials missing — healed links will NOT be written to KV.")
+		logEvent(context.Background(), slog.LevelWarn, "heal.write",
+			"reason", "cf_credentials_missing",
+		)
 	}
 
 	client := &http.Client{Timeout: 15 * time.Second}
@@ -421,11 +481,11 @@ func main() {
 	<-ctx.Done()
 	stop()
 
-	log.Println("shutting down...")
+	logEvent(context.Background(), slog.LevelInfo, "heal.check", "event_note", "shutdown")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 	close(q.ch)
 	wg.Wait()
-	log.Println("healer stopped")
+	logEvent(context.Background(), slog.LevelInfo, "heal.check", "event_note", "stopped")
 }
