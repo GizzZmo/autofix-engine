@@ -2,7 +2,7 @@
 
 help:
 	@echo "AutoFix targets:"
-	@echo "  make edge-install   - npm ci in edge-worker"
+	@echo "  make edge-install   - expand lockfile + npm ci"
 	@echo "  make edge-setup     - create KV + queues and patch wrangler.toml"
 	@echo "  make check-kv       - validate KV ids in wrangler.toml"
 	@echo "  make edge-dev       - wrangler dev"
@@ -16,6 +16,8 @@ help:
 	@echo "  make ci             - typecheck edge + build/vet healer"
 
 edge-install:
+	chmod +x scripts/expand-lockfile.sh
+	./scripts/expand-lockfile.sh
 	cd edge-worker && npm ci
 
 edge-setup:
@@ -51,5 +53,6 @@ compose-down:
 	docker compose down
 
 ci:
+	chmod +x scripts/expand-lockfile.sh && ./scripts/expand-lockfile.sh
 	cd edge-worker && npm ci && npx tsc --noEmit
 	cd healer && go mod download && go build -o autofix-healer . && go vet ./... && go test ./...
