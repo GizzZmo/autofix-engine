@@ -1,5 +1,12 @@
 # 🔧 AutoFix: The Self-Healing Web Layer
 
+[![CI](https://github.com/GizzZmo/autofix-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/GizzZmo/autofix-engine/actions/workflows/ci.yml)
+[![Deploy Edge](https://github.com/GizzZmo/autofix-engine/actions/workflows/deploy-edge.yml/badge.svg)](https://github.com/GizzZmo/autofix-engine/actions/workflows/deploy-edge.yml)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178C6?logo=typescript&logoColor=white)](./edge-worker)
+[![Go](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go&logoColor=white)](./healer)
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
+[![License](https://img.shields.io/badge/license-Use%20freely-lightgrey)](#license)
+
 [Architecture & Edge Simulator](https://aistudio.google.com/apps/69748ab5-5005-41fc-b817-64865f3368fe?showPreview=true&showAssistant=true&fullscreenApplet=true)
 
 AutoFix eliminates 404s and broken external links without requiring database migrations.
@@ -19,6 +26,28 @@ Browser → Worker (HTMLRewriter + KV + Queue + circuit breaker)
                               ▼ POST /v1/discover
                      Go Healer → Wayback → KV
 ```
+
+---
+
+## Stats
+
+| Metric | Value |
+|--------|------:|
+| Core source | ~26 KB (~740 LOC) |
+| Edge Worker | TypeScript · ~9.4 KB (~270 LOC) |
+| Go Healer | main + circuit breaker · ~14 KB (~420 LOC) |
+| Healer tests | ~1 KB (~30 LOC) |
+| Client runtime | `autofix.js` · ~1.7 KB (~50 LOC) |
+| CI / deploy workflows | 2 · path-filtered jobs |
+| Stack | Cloudflare Workers · KV · Queues · Go · Node 22 |
+| Resilience | Queues + HTTP fallback · exponential backoff · dual circuit breakers |
+
+| Component | Role |
+|-----------|------|
+| `edge-worker/` | HTML stream rewrite, KV lookup, queue producer, edge circuit breaker |
+| `healer/` | Discovery consumer, soft-404, Wayback, KV write, Wayback circuit breaker |
+| `client/` | Optional browser runtime |
+| `scripts/` | KV/queue setup, lockfile expand, KV id guard |
 
 ---
 
@@ -75,7 +104,7 @@ autofix-engine/
 ├── edge-worker/          # Cloudflare Worker
 ├── healer/               # Go healer + circuit breaker
 ├── client/autofix.js
-├── scripts/              # setup-cloudflare.sh, dev.sh
+├── scripts/              # setup-cloudflare.sh, expand-lockfile, dev.sh
 ├── docker-compose.yml
 ├── Makefile
 ├── DEPLOY.md
@@ -86,8 +115,14 @@ autofix-engine/
 
 ## CI / CD
 
-- **CI** — tsc on Worker; `go build` / `go vet` / `go test` on healer
-- **Deploy Edge** — `deploy-edge.yml` needs secrets `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`
+| Workflow | Trigger | Checks |
+|----------|---------|--------|
+| [**CI**](https://github.com/GizzZmo/autofix-engine/actions/workflows/ci.yml) | push / PR to `main` | Path filters → Edge (`npm ci` + `tsc`) · Healer (`go build` / `vet` / `test`) · ci-gate |
+| [**Deploy Edge**](https://github.com/GizzZmo/autofix-engine/actions/workflows/deploy-edge.yml) | push to `main` (edge paths) or manual | Expand lockfile → `npm ci` → KV id guard → Wrangler deploy |
+
+**Secrets for deploy:** `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`
+
+**Caching:** npm via `package-lock.json` · Go via `healer/go.sum` (no `node_modules` primary cache)
 
 ---
 
