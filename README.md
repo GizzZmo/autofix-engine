@@ -13,7 +13,8 @@
 
 AutoFix eliminates 404s and broken external links without requiring database migrations.
 
-**Deploy guide → [DEPLOY.md](./DEPLOY.md)** · **Makefile** · **docker-compose.yml**
+**Deploy guide → [DEPLOY.md](./DEPLOY.md)** · **Makefile** · **docker-compose.yml**  
+**Contracts → [autofix-polyglot](https://github.com/GizzZmo/autofix-polyglot)** (schemas, observability, versioning)
 
 ### How it works
 1. **Intercept** — Edge Worker parses HTML via `HTMLRewriter`.
@@ -31,24 +32,46 @@ Browser → Worker (HTMLRewriter + KV + Queue + circuit breaker)
 
 ---
 
+## Observability (OpenTelemetry)
+
+Normative field/metric names: [polyglot OBSERVABILITY.md](https://github.com/GizzZmo/autofix-polyglot/blob/main/docs/OBSERVABILITY.md).
+
+| Layer | What |
+|-------|------|
+| **Healer** | `healer/telemetry.go` — Prometheus **`GET /metrics`**, optional **OTLP** traces+metrics |
+| **Edge** | `edge-worker/src/telemetry.ts` — structured JSON logs + W3C **`traceparent`** on healer calls |
+
+### Healer metrics (Prometheus)
+
+- `autofix_heal_duration_seconds` / `autofix_check_duration_seconds` / `autofix_wayback_duration_seconds`
+- `autofix_circuit_state{name="healer_wayback"}` / `autofix_circuit_trips_total`
+- `autofix_queue_depth` / `autofix_discover_requests_total` / `autofix_links_total`
+
+### Enable OTLP export
+
+```bash
+# healer/.env
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+```
+
+`service.name` = `autofix-healer`. Span names: `autofix.heal`, `autofix.check`, `autofix.wayback`, `autofix.discover` (full wiring tracked in [#4](https://github.com/GizzZmo/autofix-engine/issues/4)).
+
+---
+
 ## Stats
 
 | Metric | Value |
 |--------|------:|
-| Core source | ~26 KB (~740 LOC) |
-| Edge Worker | TypeScript · ~9.4 KB (~270 LOC) |
-| Go Healer | main + circuit breaker · ~14 KB (~420 LOC) |
-| Healer tests | ~1 KB (~30 LOC) |
-| **Go coverage** | **17.6%** statements (circuit breaker ~90%+) |
-| Client runtime | `autofix.js` · ~1.7 KB (~50 LOC) |
-| CI / deploy workflows | 2 · path-filtered jobs |
-| Stack | Cloudflare Workers · KV · Queues · Go · Node 22 |
+| Core source | ~26 KB+ |
+| Edge Worker | TypeScript |
+| Go Healer | main + circuit breaker + **telemetry** |
+| Stack | Cloudflare Workers · KV · Queues · Go · Node 22 · OpenTelemetry |
 | Resilience | Queues + HTTP fallback · exponential backoff · dual circuit breakers |
 
 | Component | Role |
 |-----------|------|
 | `edge-worker/` | HTML stream rewrite, KV lookup, queue producer, edge circuit breaker |
-| `healer/` | Discovery consumer, soft-404, Wayback, KV write, Wayback circuit breaker |
+| `healer/` | Discovery, soft-404, Wayback, KV write, OTel metrics/traces |
 | `client/` | Optional browser runtime |
 | `scripts/` | KV/queue setup, lockfile expand, KV id guard |
 
@@ -64,8 +87,9 @@ wrangler login
 ./scripts/setup-cloudflare.sh   # create KV + queues; paste ids into wrangler.toml
 make edge-deploy
 
-cp healer/.env.example healer/.env   # fill CF_*
+cp healer/.env.example healer/.env   # fill CF_* ; optional OTEL_EXPORTER_OTLP_ENDPOINT
 make healer-run                      # or: make compose-up
+# scrape metrics: curl localhost:8080/metrics
 # expose healer, then:
 cd edge-worker && npx wrangler secret put HEALER_DISCOVER_URL
 ```
@@ -84,32 +108,8 @@ Local full stack: `./scripts/dev.sh` (healer + `wrangler dev`).
 | `make edge-tail` | Live logs |
 | `make healer-run` | Run Go healer |
 | `make healer-test` | Unit tests + coverage |
-| `make healer-bench` | CPU benchmarks (`-count=3`) → `healer/bench.txt` |
-| `make healer-bench-cpu` | CPU profile → `healer/cpu.prof` |
-| `make healer-bench-mem` | Memory profile → `healer/mem.prof` |
-| `make healer-benchstat OLD=a.txt NEW=b.txt` | Compare with [benchstat](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat) |
 | `make compose-up` | Docker Compose healer |
-| `make ci` | Typecheck + build/vet/test/short-bench |
-
-### Benchmarks (healer)
-
-```bash
-make healer-bench
-# or:
-cd healer && go test -run=^$ -bench=. -benchmem -count=3 ./...
-
-# Profiles
-make healer-bench-cpu   # go tool pprof healer/cpu.prof
-make healer-bench-mem   # go tool pprof healer/mem.prof
-
-# Before/after comparison
-make healer-bench && cp healer/bench.txt old.txt
-# ... change code ...
-make healer-bench && cp healer/bench.txt new.txt
-make healer-benchstat OLD=old.txt NEW=new.txt
-```
-
-Hot paths covered: circuit breaker (success / fail / open / parallel), soft-404 heuristics, discovery queue enqueue, KV `keyFor`.
+| `make ci` | Typecheck + build/vet/test |
 
 ---
 
@@ -129,14 +129,14 @@ Hot paths covered: circuit breaker (success / fail / open / parallel), soft-404 
 
 ```
 autofix-engine/
-├── edge-worker/          # Cloudflare Worker
-├── healer/               # Go healer + circuit breaker + benches
+├── edge-worker/          # Worker + telemetry.ts
+├── healer/               # Go healer + telemetry.go + circuit breaker
 ├── client/autofix.js
-├── scripts/              # setup-cloudflare.sh, expand-lockfile, dev.sh
+├── scripts/
 ├── docker-compose.yml
 ├── Makefile
 ├── DEPLOY.md
-└── .github/workflows/    # ci.yml, deploy-edge.yml
+└── .github/workflows/
 ```
 
 ---
@@ -145,16 +145,10 @@ autofix-engine/
 
 | Workflow | Trigger | Checks |
 |----------|---------|--------|
-| [**CI**](https://github.com/GizzZmo/autofix-engine/actions/workflows/ci.yml) | push / PR to `main` | Path filters → Edge (`npm ci` + `tsc`) · Healer (`go build` / `vet` / `test` + **coverage** + **short benches**) · ci-gate |
-| [**Deploy Edge**](https://github.com/GizzZmo/autofix-engine/actions/workflows/deploy-edge.yml) | push to `main` (edge paths) or manual | Expand lockfile → `npm ci` → KV id guard → Wrangler deploy |
-
-**Coverage:** `go test -coverprofile=coverage.out` · artifact `healer-coverage` · optional [Codecov](https://codecov.io/gh/GizzZmo/autofix-engine) when `CODECOV_TOKEN` is set.
-
-**Benchmarks:** CI runs `-benchtime=100ms` and uploads artifact `healer-bench` (`bench.txt`). Local: `make healer-bench`.
+| **CI** | push / PR to `main` | Edge `tsc` · Healer `go build` / `vet` / `test` |
+| **Deploy Edge** | push to `main` (edge paths) | Wrangler deploy |
 
 **Secrets for deploy:** `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`
-
-**Caching:** npm via `package-lock.json` · Go via `healer/go.sum` (no `node_modules` primary cache)
 
 ---
 
