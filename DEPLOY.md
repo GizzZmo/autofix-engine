@@ -2,7 +2,7 @@
 
 End-to-end instructions to deploy the Edge Worker (Cloudflare) and the Go Healer.
 
-Also see: `Makefile`, `scripts/setup-cloudflare.sh`, `docker-compose.yml`.
+Also see: `Makefile`, `scripts/setup-cloudflare.sh`, `scripts/ensure-cloudflare-resources.sh`, `docker-compose.yml`.
 
 ---
 
@@ -23,7 +23,7 @@ You need:
 
 1. A **Cloudflare account** (Workers + KV + Queues)
 2. A host for the **healer** (local + tunnel is fine for testing)
-3. A **CF API token** with KV edit permission (for the healer)
+3. A **CF API token** with Workers deploy + KV edit permission
 
 ---
 
@@ -45,14 +45,23 @@ cd autofix-engine
 
 ## 1. Bootstrap Cloudflare resources
 
-### Automated
+### Local (interactive)
 
 ```bash
 chmod +x scripts/setup-cloudflare.sh
 ./scripts/setup-cloudflare.sh
 ```
 
-This creates KV namespaces + queues and **patches** `edge-worker/wrangler.toml` with real ids.
+Creates KV namespaces + queues and patches `edge-worker/wrangler.toml`.
+
+### CI (automatic)
+
+On deploy, `scripts/ensure-cloudflare-resources.sh` runs with your API token:
+
+1. Uses `vars.CLOUDFLARE_KV_*` if set
+2. Otherwise **creates** (or resolves existing) `AUTOFIX_KV` production + preview namespaces
+3. Ensures queues `autofix-discovery` and `autofix-discovery-dlq`
+4. Patches `wrangler.toml` for that job only (ids are not committed)
 
 ### Manual
 
@@ -65,7 +74,13 @@ npx wrangler queues create autofix-discovery
 npx wrangler queues create autofix-discovery-dlq   # optional
 ```
 
-Paste KV `id` / `preview_id` into `edge-worker/wrangler.toml`.
+Paste KV `id` / `preview_id` into `edge-worker/wrangler.toml`, or export:
+
+```bash
+export CLOUDFLARE_KV_NAMESPACE_ID=...
+export CLOUDFLARE_KV_PREVIEW_ID=...
+./scripts/check-wrangler-kv.sh --write
+```
 
 Validate:
 
@@ -73,12 +88,15 @@ Validate:
 ./scripts/check-wrangler-kv.sh edge-worker/wrangler.toml
 ```
 
-Uncomment `dead_letter_queue` only after creating the DLQ.
+Uncomment `dead_letter_queue` only after the DLQ exists.
 
-### API token for the healer
+### API token
 
 1. [API Tokens](https://dash.cloudflare.com/profile/api-tokens) → Create Token
-2. Permission: **Account → Workers KV Storage → Edit**
+2. Permissions:
+   - **Account → Workers Scripts → Edit**
+   - **Account → Workers KV Storage → Edit**
+   - **Account → Queues → Edit** (if available on your plan)
 3. Copy token + Account ID (dashboard sidebar)
 
 ---
@@ -94,25 +112,21 @@ make edge-deploy
 
 Workflow: `.github/workflows/deploy-edge.yml` (path-filtered on `main`, or **workflow_dispatch**).
 
-**Secrets** (Settings → Secrets and variables → Actions):
+**Required secrets** (Settings → Secrets and variables → Actions):
 
 | Name | Value |
 |------|--------|
-| `CLOUDFLARE_API_TOKEN` | Token with Workers **Edit** |
+| `CLOUDFLARE_API_TOKEN` | Token with Workers + KV (+ Queues) Edit |
 | `CLOUDFLARE_ACCOUNT_ID` | Account ID |
 
-**Variables** (same page → Variables tab) — preferred so ids are not committed:
+**Optional variables** (skip auto-create when you already know ids):
 
 | Name | Value |
 |------|--------|
 | `CLOUDFLARE_KV_NAMESPACE_ID` | 32-char hex production KV id |
 | `CLOUDFLARE_KV_PREVIEW_ID` | 32-char hex preview KV id |
 
-At deploy time the workflow injects those variables into `wrangler.toml` via `scripts/check-wrangler-kv.sh --write`.
-
-If KV vars **or** Cloudflare secrets are missing, the job **skips deploy** with a warning (does not fail the push). Template placeholders in git are intentional.
-
-Alternatively, commit real ids after `./scripts/setup-cloudflare.sh` and omit the Variables.
+If secrets are missing, the job **skips deploy** with a warning (does not fail the push).
 
 Set `HEALER_DISCOVER_URL` once manually:
 
@@ -142,7 +156,7 @@ cp .env.example .env
 # CF_ACCOUNT_ID, CF_API_TOKEN, CF_KV_NAMESPACE_ID, HEALER_LISTEN
 ```
 
-Use the **same** production KV namespace id as `CLOUDFLARE_KV_NAMESPACE_ID` / `wrangler.toml` `id`.
+Use the **same** production KV namespace id as the Worker (`id` in wrangler / CI logs).
 
 ### Local + tunnel
 
@@ -154,7 +168,6 @@ cloudflared tunnel --url http://localhost:8080
 ### Docker Compose
 
 ```bash
-# ensure healer/.env exists
 make compose-up
 curl -s http://127.0.0.1:8080/healthz
 ```
@@ -164,15 +177,6 @@ curl -s http://127.0.0.1:8080/healthz
 ```bash
 make healer-docker
 docker run -d --name autofix-healer --env-file healer/.env -p 8080:8080 --restart unless-stopped autofix-healer
-```
-
-### systemd (VPS)
-
-```bash
-cd healer && go build -o autofix-healer .
-sudo mv autofix-healer /usr/local/bin/
-# EnvironmentFile=/etc/autofix-healer.env with CF_* vars
-# ExecStart=/usr/local/bin/autofix-healer
 ```
 
 ---
@@ -216,29 +220,26 @@ curl -s -X POST https://<healer>/v1/discover \
 make edge-tail
 ```
 
-Load a page through the Worker with external links → Queue / DISCOVERED logs → healer HEALED/DEAD → later requests rewrite links.
-
 ---
 
 ## 7. Troubleshooting
 
 | Symptom | Likely cause |
 |---------|----------------|
-| Deploy skips on KV id | Set repo Variables or run `setup-cloudflare.sh` |
-| Deploy fails on DLQ | Create queue or comment out `dead_letter_queue` |
+| Deploy skips | Missing `CLOUDFLARE_API_TOKEN` / `ACCOUNT_ID` |
+| Ensure KV fails | Token lacks **Workers KV Storage → Edit** |
+| Queue create warns | Plan/permissions; create queue in dashboard |
 | No healer traffic | Missing/wrong `HEALER_DISCOVER_URL` |
-| `CircuitOpen` | Healer down; wait or fix healer |
-| KV not updating | Healer `CF_*` / wrong namespace id |
-| CI deploy skips | Missing secrets/vars (expected until configured) |
+| `CircuitOpen` | Healer down |
+| KV not updating | Healer `CF_KV_NAMESPACE_ID` ≠ Worker prod id |
 
 ---
 
 ## 8. Security
 
 - Use `wrangler secret` for `HEALER_DISCOVER_URL`
-- Prefer **repository Variables** for KV ids over committing them
+- Prefer CI auto-create or repository Variables over committing KV ids
 - Restrict healer ingress (tunnel, firewall, Access)
-- KV-only API token for the healer
 - Never commit `.env` / `.dev.vars`
 
 ---
@@ -246,9 +247,10 @@ Load a page through the Worker with external links → Queue / DISCOVERED logs �
 ## Quick reference
 
 ```bash
-./scripts/setup-cloudflare.sh
+./scripts/setup-cloudflare.sh   # local
+# or: only CLOUDFLARE_API_TOKEN + ACCOUNT_ID on GitHub → auto KV on deploy
 make edge-deploy
-make compose-up   # or make healer-run
+make compose-up
 npx wrangler secret put HEALER_DISCOVER_URL
 make edge-tail
 ```
