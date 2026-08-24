@@ -8,6 +8,8 @@ on:
       - "edge-worker/**"
       - ".github/workflows/deploy-edge.yml"
       - "scripts/check-wrangler-kv.sh"
+      - "scripts/ensure-cloudflare-resources.sh"
+      - "scripts/setup-cloudflare.sh"
 
 jobs:
   deploy:
@@ -35,50 +37,39 @@ jobs:
         working-directory: edge-worker
         run: npx tsc --noEmit
 
-      # Inject account-specific KV ids from repository Variables (not committed).
-      # Optional: commit real ids in wrangler.toml after ./scripts/setup-cloudflare.sh
-      - name: Validate / inject KV namespace ids
-        id: kv
+      - name: Check Cloudflare credentials
+        id: creds
+        run: |
+          if [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ] || [ -z "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Skipping deploy — set secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID."
+            echo "Token needs Account → Workers Scripts Edit + Workers KV Storage Edit."
+            exit 0
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      # Create or resolve AUTOFIX_KV (prod + preview) and discovery queues,
+      # then patch edge-worker/wrangler.toml for this job.
+      - name: Ensure KV namespaces and queues
+        id: ensure
+        if: steps.creds.outputs.ready == 'true'
         env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Optional pre-seeded ids (skip create when set)
           CLOUDFLARE_KV_NAMESPACE_ID: ${{ vars.CLOUDFLARE_KV_NAMESPACE_ID }}
           CLOUDFLARE_KV_PREVIEW_ID: ${{ vars.CLOUDFLARE_KV_PREVIEW_ID }}
+          SKIP_NPM: "1"
         run: |
-          chmod +x scripts/check-wrangler-kv.sh
-          set +e
-          ./scripts/check-wrangler-kv.sh --write edge-worker/wrangler.toml
-          rc=$?
-          set -e
-          if [[ "$rc" -ne 0 ]]; then
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::KV ids not configured — skipping Cloudflare deploy."
-            echo "Set repository Variables CLOUDFLARE_KV_NAMESPACE_ID and CLOUDFLARE_KV_PREVIEW_ID,"
-            echo "or run ./scripts/setup-cloudflare.sh and commit wrangler.toml. See DEPLOY.md"
-            exit 0
-          fi
-          echo "ready=true" >> "$GITHUB_OUTPUT"
+          chmod +x scripts/ensure-cloudflare-resources.sh scripts/check-wrangler-kv.sh
+          ./scripts/ensure-cloudflare-resources.sh
 
-      - name: Check Cloudflare secrets
-        id: secrets
-        if: steps.kv.outputs.ready == 'true'
-        run: |
-          ok=true
-          if [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]; then
-            echo "::warning::Missing secret CLOUDFLARE_API_TOKEN"
-            ok=false
-          fi
-          if [ -z "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ]; then
-            echo "::warning::Missing secret CLOUDFLARE_ACCOUNT_ID"
-            ok=false
-          fi
-          if [ "$ok" != "true" ]; then
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Skipping deploy — add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID secrets."
-            exit 0
-          fi
-          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - name: Validate wrangler.toml KV ids
+        if: steps.creds.outputs.ready == 'true'
+        run: ./scripts/check-wrangler-kv.sh edge-worker/wrangler.toml
 
       - name: Deploy with Wrangler
-        if: steps.kv.outputs.ready == 'true' && steps.secrets.outputs.ready == 'true'
+        if: steps.creds.outputs.ready == 'true'
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
