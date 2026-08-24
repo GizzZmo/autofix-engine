@@ -3,6 +3,9 @@
 //
 // Contracts: https://github.com/GizzZmo/autofix-polyglot
 // Types: ./types (synced from polyglot types/typescript)
+//
+// Streaming resilience: never HoL-block HTMLRewriter on sequential KV.
+// L1 memoization + cacheTtl + timed race keep the downstream pipe moving.
 
 import type { LinkRecord, DiscoveryMessage } from "./types";
 import { urlKey } from "./types";
@@ -15,6 +18,12 @@ export interface Env {
   ENVIRONMENT?: string;
 }
 
+/** Max time a single link KV lookup may block the rewriter stream. */
+const KV_LOOKUP_BUDGET_MS = 200;
+
+/** Workers KV edge cache TTL (seconds) for link records. */
+const KV_CACHE_TTL_SEC = 3600;
+
 /** HTMLRewriter Element has no classList — append a class token safely. */
 function addClass(element: Element, token: string): void {
   const existing = element.getAttribute("class") || "";
@@ -22,6 +31,46 @@ function addClass(element: Element, token: string): void {
   if (!parts.includes(token)) {
     parts.push(token);
     element.setAttribute("class", parts.join(" "));
+  }
+}
+
+/**
+ * Request-scope L1 cache: key → in-flight/resolved KV promise.
+ * Duplicate hrefs in the same document share one get (no sequential waterfall).
+ */
+class KvLookupCache {
+  private readonly inflight = new Map<string, Promise<LinkRecord | null>>();
+
+  constructor(private readonly kv: KVNamespace) {}
+
+  /** Start or reuse a KV get (does not apply the stream timeout). */
+  get(key: string): Promise<LinkRecord | null> {
+    let p = this.inflight.get(key);
+    if (!p) {
+      p = this.kv
+        .get(key, { type: "json", cacheTtl: KV_CACHE_TTL_SEC })
+        .then((v) => (v as LinkRecord | null) ?? null)
+        .catch(() => null);
+      this.inflight.set(key, p);
+    }
+    return p;
+  }
+
+  /**
+   * Bounded wait for the rewriter path. On timeout returns null so the
+   * stream continues; the underlying get keeps running (L1 still fills).
+   */
+  async getWithinBudget(key: string): Promise<LinkRecord | null | "timeout"> {
+    const lookup = this.get(key);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), KV_LOOKUP_BUDGET_MS);
+    });
+    try {
+      return await Promise.race([lookup, budget]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 }
 
@@ -111,8 +160,84 @@ class CircuitBreaker {
 /** Shared breaker for all healer POSTs in this isolate. */
 const healerBreaker = new CircuitBreaker(5, 30_000, 1);
 
+/**
+ * Element handler: shared L1 KV cache per request; never stalls > budget.
+ */
+class AnchorHandler {
+  constructor(
+    private readonly pageUrl: string,
+    private readonly kvCache: KvLookupCache,
+    private readonly discovered: Set<string>
+  ) {}
+
+  async element(element: Element): Promise<void> {
+    try {
+      const href = element.getAttribute("href");
+      if (
+        !href ||
+        href.startsWith("/") ||
+        href.startsWith("#") ||
+        href.startsWith("mailto:") ||
+        href.startsWith("javascript:")
+      ) {
+        return;
+      }
+
+      let absolute: string;
+      try {
+        absolute = new URL(href, this.pageUrl).href;
+      } catch {
+        return;
+      }
+      if (!absolute.startsWith("http://") && !absolute.startsWith("https://")) {
+        return;
+      }
+
+      const key = urlKey(absolute);
+      const result = await this.kvCache.getWithinBudget(key);
+
+      if (result === "timeout") {
+        // Stream continues; underlying get may still populate L1 for later links.
+        // Optimistic discover — reportDiscoveries is idempotent if record exists.
+        this.discovered.add(absolute);
+        logEvent({
+          event: "link.rewrite",
+          level: "debug",
+          url: absolute,
+          url_key: key,
+          reason: "kv_timeout",
+          duration_ms: KV_LOOKUP_BUDGET_MS,
+        });
+        return;
+      }
+
+      const cached = result;
+      if (cached?.status === "HEALED" && cached.resolved_url) {
+        element.setAttribute("href", cached.resolved_url);
+        element.setAttribute("data-autofix-original", absolute);
+        element.setAttribute("rel", "nofollow archived");
+        addClass(element, "autofix-healed");
+        logEvent({
+          event: "link.rewrite",
+          level: "debug",
+          url: absolute,
+          url_key: key,
+          status: "HEALED",
+          resolved_url: cached.resolved_url,
+        });
+      } else if (!cached) {
+        this.discovered.add(absolute);
+      }
+    } catch {
+      // Never break the stream for a single link
+    }
+  }
+}
+
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    // Origin fetch first — dynamic href keys are only known during parse,
+    // so speculative multi-key prefetch is not applicable; L1 + budget apply.
     let response: Response;
     try {
       response = await fetch(request);
@@ -130,61 +255,15 @@ const worker = {
     }
 
     const discovered = new Set<string>();
+    const kvCache = new KvLookupCache(env.AUTOFIX_KV);
+    const handler = new AnchorHandler(request.url, kvCache, discovered);
 
     try {
       const transformed = new HTMLRewriter()
-        .on("a[href]", {
-          async element(element) {
-            try {
-              const href = element.getAttribute("href");
-              if (
-                !href ||
-                href.startsWith("/") ||
-                href.startsWith("#") ||
-                href.startsWith("mailto:") ||
-                href.startsWith("javascript:")
-              ) {
-                return;
-              }
-
-              let absolute: string;
-              try {
-                absolute = new URL(href, request.url).href;
-              } catch {
-                return;
-              }
-              if (!absolute.startsWith("http://") && !absolute.startsWith("https://")) {
-                return;
-              }
-
-              const key = urlKey(absolute);
-              const cached = (await env.AUTOFIX_KV.get(key, {
-                type: "json",
-              })) as LinkRecord | null;
-
-              if (cached?.status === "HEALED" && cached.resolved_url) {
-                element.setAttribute("href", cached.resolved_url);
-                element.setAttribute("data-autofix-original", absolute);
-                element.setAttribute("rel", "nofollow archived");
-                addClass(element, "autofix-healed");
-                logEvent({
-                  event: "link.rewrite",
-                  level: "debug",
-                  url: absolute,
-                  url_key: key,
-                  status: "HEALED",
-                  resolved_url: cached.resolved_url,
-                });
-              } else if (!cached) {
-                discovered.add(absolute);
-              }
-            } catch {
-              // Never break the stream for a single link
-            }
-          },
-        })
+        .on("a[href]", handler)
         .transform(response);
 
+      // Side-effects off the critical stream path
       if (discovered.size > 0) {
         ctx.waitUntil(
           reportDiscoveries(env, Array.from(discovered)).catch((err) => {
@@ -334,11 +413,14 @@ async function reportDiscoveries(env: Env, urls: string[]): Promise<void> {
   const t0 = Date.now();
 
   if (env.AUTOFIX_KV) {
+    // Parallel KV puts — off the HTML stream (waitUntil)
     await Promise.all(
       urls.map(async (url) => {
         try {
           const key = urlKey(url);
-          const existing = await env.AUTOFIX_KV.get(key);
+          const existing = await env.AUTOFIX_KV.get(key, {
+            cacheTtl: KV_CACHE_TTL_SEC,
+          });
           if (existing) return;
           const record: LinkRecord = {
             status: "PENDING",
