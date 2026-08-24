@@ -52,18 +52,26 @@ chmod +x scripts/setup-cloudflare.sh
 ./scripts/setup-cloudflare.sh
 ```
 
+This creates KV namespaces + queues and **patches** `edge-worker/wrangler.toml` with real ids.
+
 ### Manual
 
 ```bash
 cd edge-worker && npm install
 
-npx wrangler kv:namespace create AUTOFIX_KV
-npx wrangler kv:namespace create AUTOFIX_KV --preview
+npx wrangler kv namespace create AUTOFIX_KV
+npx wrangler kv namespace create AUTOFIX_KV --preview
 npx wrangler queues create autofix-discovery
 npx wrangler queues create autofix-discovery-dlq   # optional
 ```
 
 Paste KV `id` / `preview_id` into `edge-worker/wrangler.toml`.
+
+Validate:
+
+```bash
+./scripts/check-wrangler-kv.sh edge-worker/wrangler.toml
+```
 
 Uncomment `dead_letter_queue` only after creating the DLQ.
 
@@ -82,18 +90,35 @@ make edge-deploy
 # or: cd edge-worker && npx wrangler deploy
 ```
 
-### CI deploy (optional)
+### CI deploy
 
-Repo → Settings → Secrets:
+Workflow: `.github/workflows/deploy-edge.yml` (path-filtered on `main`, or **workflow_dispatch**).
 
-| Secret | Value |
-|--------|--------|
-| `CLOUDFLARE_API_TOKEN` | Token with Workers deploy rights |
+**Secrets** (Settings → Secrets and variables → Actions):
+
+| Name | Value |
+|------|--------|
+| `CLOUDFLARE_API_TOKEN` | Token with Workers **Edit** |
 | `CLOUDFLARE_ACCOUNT_ID` | Account ID |
 
-Workflow: `.github/workflows/deploy-edge.yml` (runs on `main` pushes under `edge-worker/`, or **workflow_dispatch**).
+**Variables** (same page → Variables tab) — preferred so ids are not committed:
 
-Set `HEALER_DISCOVER_URL` once manually (`wrangler secret put`) — not injected by CI by default.
+| Name | Value |
+|------|--------|
+| `CLOUDFLARE_KV_NAMESPACE_ID` | 32-char hex production KV id |
+| `CLOUDFLARE_KV_PREVIEW_ID` | 32-char hex preview KV id |
+
+At deploy time the workflow injects those variables into `wrangler.toml` via `scripts/check-wrangler-kv.sh --write`.
+
+If KV vars **or** Cloudflare secrets are missing, the job **skips deploy** with a warning (does not fail the push). Template placeholders in git are intentional.
+
+Alternatively, commit real ids after `./scripts/setup-cloudflare.sh` and omit the Variables.
+
+Set `HEALER_DISCOVER_URL` once manually:
+
+```bash
+cd edge-worker && npx wrangler secret put HEALER_DISCOVER_URL
+```
 
 ### Custom routes
 
@@ -116,6 +141,8 @@ cd healer
 cp .env.example .env
 # CF_ACCOUNT_ID, CF_API_TOKEN, CF_KV_NAMESPACE_ID, HEALER_LISTEN
 ```
+
+Use the **same** production KV namespace id as `CLOUDFLARE_KV_NAMESPACE_ID` / `wrangler.toml` `id`.
 
 ### Local + tunnel
 
@@ -163,7 +190,6 @@ npx wrangler secret put HEALER_DISCOVER_URL
 ## 5. Local development
 
 ```bash
-# Terminal-friendly one-shot (healer + wrangler)
 chmod +x scripts/dev.sh
 ./scripts/dev.sh
 ```
@@ -198,18 +224,19 @@ Load a page through the Worker with external links → Queue / DISCOVERED logs �
 
 | Symptom | Likely cause |
 |---------|----------------|
-| Deploy fails on KV id | Placeholder still in `wrangler.toml` |
+| Deploy skips on KV id | Set repo Variables or run `setup-cloudflare.sh` |
 | Deploy fails on DLQ | Create queue or comment out `dead_letter_queue` |
 | No healer traffic | Missing/wrong `HEALER_DISCOVER_URL` |
 | `CircuitOpen` | Healer down; wait or fix healer |
 | KV not updating | Healer `CF_*` / wrong namespace id |
-| CI deploy fails | Missing GitHub secrets or KV ids not in toml |
+| CI deploy skips | Missing secrets/vars (expected until configured) |
 
 ---
 
 ## 8. Security
 
 - Use `wrangler secret` for `HEALER_DISCOVER_URL`
+- Prefer **repository Variables** for KV ids over committing them
 - Restrict healer ingress (tunnel, firewall, Access)
 - KV-only API token for the healer
 - Never commit `.env` / `.dev.vars`
