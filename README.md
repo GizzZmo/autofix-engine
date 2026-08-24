@@ -14,7 +14,8 @@
 AutoFix eliminates 404s and broken external links without requiring database migrations.
 
 **Deploy guide → [DEPLOY.md](./DEPLOY.md)** · **Makefile** · **docker-compose.yml**  
-**Contracts → [autofix-polyglot](https://github.com/GizzZmo/autofix-polyglot)** (schemas, observability, versioning)
+**Contracts → [autofix-polyglot](https://github.com/GizzZmo/autofix-polyglot)** (schemas, observability, versioning, command centre)  
+**Ops UI → [command-centre/](./command-centre/)** (Phase 7A stats against `/metrics` + `/healthz`)
 
 ### How it works
 1. **Intercept** — Edge Worker parses HTML via `HTMLRewriter`.
@@ -40,6 +41,7 @@ Normative field/metric names: [polyglot OBSERVABILITY.md](https://github.com/Giz
 |-------|------|
 | **Healer** | `healer/telemetry.go` — Prometheus **`GET /metrics`**, optional **OTLP** traces+metrics |
 | **Edge** | `edge-worker/src/telemetry.ts` — structured JSON logs + W3C **`traceparent`** on healer calls |
+| **Command centre** | `command-centre/` — human stats UI (read-only) |
 
 ### Healer metrics (Prometheus)
 
@@ -55,6 +57,18 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 ```
 
 `service.name` = `autofix-healer`. Span names: `autofix.heal`, `autofix.check`, `autofix.wayback`, `autofix.discover` — wired in `main.go` and edge `index.ts`.
+
+### Command centre (stats)
+
+```bash
+# terminal 1
+cd healer && go run .
+# terminal 2
+cd command-centre && python3 -m http.server 8090
+# open http://localhost:8090 — set Healer URL to http://localhost:8080
+```
+
+Contracts: [COMMAND_CENTRE.md](https://github.com/GizzZmo/autofix-polyglot/blob/main/docs/COMMAND_CENTRE.md). No write/supervise actions yet (Phase 7B).
 
 ---
 
@@ -72,6 +86,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 |-----------|------|
 | `edge-worker/` | HTML stream rewrite, KV lookup, queue producer, edge circuit breaker |
 | `healer/` | Discovery, soft-404, Wayback, KV write, OTel metrics/traces |
+| `command-centre/` | Ops stats UI (Phase 7A) |
 | `client/` | Optional browser runtime |
 | `scripts/` | KV/queue setup, lockfile expand, KV id guard |
 
@@ -90,6 +105,7 @@ make edge-deploy
 cp healer/.env.example healer/.env   # fill CF_* ; optional OTEL_EXPORTER_OTLP_ENDPOINT
 make healer-run                      # or: make compose-up
 # scrape metrics: curl localhost:8080/metrics
+# ops UI: cd command-centre && python3 -m http.server 8090
 # expose healer, then:
 cd edge-worker && npx wrangler secret put HEALER_DISCOVER_URL
 ```
@@ -131,6 +147,7 @@ Local full stack: `./scripts/dev.sh` (healer + `wrangler dev`).
 autofix-engine/
 ├── edge-worker/          # Worker + telemetry.ts
 ├── healer/               # Go healer + telemetry.go + circuit breaker
+├── command-centre/       # Phase 7A stats UI
 ├── client/autofix.js
 ├── scripts/
 ├── docker-compose.yml
