@@ -26,7 +26,7 @@ edge-install:
 	cd edge-worker && npm ci
 
 edge-setup:
-	chmod +x scripts/setup-cloudflare.sh scripts/check-wrangler-kv.sh
+	chmod +x scripts/setup-cloudflare.sh scripts/ensure-cloudflare-resources.sh scripts/check-wrangler-kv.sh
 	./scripts/setup-cloudflare.sh
 
 check-kv:
