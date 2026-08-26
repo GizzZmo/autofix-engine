@@ -1,0 +1,48 @@
+# Local OTel stack: collector + Tempo + Prometheus.
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.otel.yml up --build
+# Healer should set:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+#
+# UIs:
+#   Prometheus  http://localhost:9090
+#   Tempo       http://localhost:3200
+#   OTLP HTTP   http://localhost:4318
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.109.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel/collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "8889:8889"
+    depends_on:
+      - tempo
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./otel/tempo.yaml:/etc/tempo.yaml:ro
+    ports:
+      - "3200:3200"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-lifecycle
+    volumes:
+      - ./otel/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  healer:
+    environment:
+      HEALER_LISTEN: ":8080"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    depends_on:
+      - otel-collector
