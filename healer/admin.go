@@ -111,3 +111,122 @@ func requireAdminToken(token string, next http.HandlerFunc) http.HandlerFunc {
 		next(w, r)
 	}
 }
+
+func registerAdminRoutes(mux *http.ServeMux, q *DiscoveryQueue, kv *CloudflareKV, tel *Telemetry, audit *AuditLog, adminToken string) {
+	mux.HandleFunc("GET /v1/admin/audit", requireAdminToken(adminToken, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"events": audit.List()})
+	}))
+
+	mux.HandleFunc("POST /v1/admin/actions", requireAdminToken(adminToken, func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		ctx, span := tel.Tracer.Start(ctx, "autofix.admin", trace.WithSpanKind(trace.SpanKindServer))
+		defer span.End()
+
+		var req AdminActionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+			return
+		}
+		ts := time.Now().UTC().Format(time.RFC3339)
+		ev := AdminAuditEvent{AuditID: newAuditID(), Ts: ts, Actor: req.Actor, Action: req.Action, Reason: req.Reason, URLs: req.URLs, CircuitName: req.CircuitName}
+		if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+			ev.TraceID = sc.TraceID().String()
+		}
+		resp := AdminActionResponse{Action: req.Action, AuditID: ev.AuditID, Ts: ts}
+		if req.Actor == "" || req.Reason == "" || req.Action == "" {
+			ev.Error = "actor, action, and reason are required"
+			resp.Error = ev.Error
+			audit.Append(ev)
+			recordAdminMetric(ctx, tel, req.Action, false)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		switch req.Action {
+		case "link.requeue":
+			if len(req.URLs) == 0 {
+				ev.Error = "urls required"
+			} else {
+				n := 0
+				for _, u := range req.URLs {
+					if u == "" {
+						continue
+					}
+					q.EnqueueForce(u)
+					n++
+				}
+				ev.OK = true
+				resp.OK = true
+				resp.Result = map[string]any{"enqueued": n}
+				ev.After = resp.Result
+			}
+		case "link.override":
+			if kv == nil {
+				ev.Error = "kv client unavailable"
+			} else if len(req.URLs) == 0 || req.Status == "" {
+				ev.Error = "urls and status required"
+			} else {
+				written := 0
+				for _, u := range req.URLs {
+					if u == "" {
+						continue
+					}
+					rec := LinkRecord{Status: req.Status, OriginalURL: u, ResolvedURL: req.ResolvedURL, HealedAt: ts, Reason: "admin_override:" + req.Reason}
+					if err := kv.Put(ctx, keyFor(u), rec); err != nil {
+						ev.Error = err.Error()
+						break
+					}
+					tel.RecordLink(ctx, req.Status)
+					written++
+				}
+				if ev.Error == "" {
+					ev.OK = true
+					resp.OK = true
+					resp.Result = map[string]any{"written": written, "status": req.Status}
+					ev.After = resp.Result
+				}
+			}
+		case "circuit.reset":
+			if req.CircuitName != "" && req.CircuitName != "healer_wayback" {
+				ev.Error = "unknown circuit_name"
+			} else {
+				before := waybackBreaker.State()
+				waybackBreaker.Reset()
+				ev.OK = true
+				resp.OK = true
+				ev.Before = map[string]any{"state": before}
+				ev.After = map[string]any{"state": waybackBreaker.State()}
+				resp.Result = map[string]any{"circuit_name": "healer_wayback", "state": waybackBreaker.State()}
+			}
+		case "discovery.pause":
+			q.SetPaused(true)
+			ev.OK = true
+			resp.OK = true
+			resp.Result = map[string]any{"paused": true}
+			ev.After = resp.Result
+		case "discovery.resume":
+			q.SetPaused(false)
+			ev.OK = true
+			resp.OK = true
+			resp.Result = map[string]any{"paused": false}
+			ev.After = resp.Result
+		default:
+			ev.Error = "unknown action"
+		}
+		if ev.Error != "" {
+			resp.Error = ev.Error
+		}
+		audit.Append(ev)
+		recordAdminMetric(ctx, tel, req.Action, ev.OK)
+		logEvent(ctx, slog.LevelInfo, "admin.action", "actor", req.Actor, "action", req.Action, "audit_id", ev.AuditID, "ok", ev.OK, "reason", req.Reason)
+		code := http.StatusOK
+		if !ev.OK {
+			code = http.StatusBadRequest
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+}
