@@ -19,176 +19,57 @@
       --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
     * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: var(--font);
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-    }
-    header {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 0.75rem 1.25rem;
-      padding: 1rem 1.5rem;
-      border-bottom: 1px solid var(--border);
-      background: var(--panel);
-    }
-    header h1 {
-      margin: 0;
-      font-size: 1.15rem;
-      font-weight: 600;
-      letter-spacing: -0.02em;
-    }
-    header .badge {
-      font-size: 0.7rem;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--muted);
-      border: 1px solid var(--border);
-      padding: 0.15rem 0.45rem;
-      border-radius: 999px;
-    }
-    .controls {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.5rem;
-      margin-left: auto;
-      align-items: center;
-    }
+    body { margin: 0; font-family: var(--font); background: var(--bg); color: var(--text); min-height: 100vh; }
+    header { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1.25rem; padding: 1rem 1.5rem; border-bottom: 1px solid var(--border); background: var(--panel); }
+    header h1 { margin: 0; font-size: 1.15rem; font-weight: 600; letter-spacing: -0.02em; }
+    header .badge { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); border: 1px solid var(--border); padding: 0.15rem 0.45rem; border-radius: 999px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-left: auto; align-items: center; }
     .controls label { font-size: 0.8rem; color: var(--muted); }
-    input[type="url"], input[type="number"] {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      color: var(--text);
-      padding: 0.4rem 0.6rem;
-      border-radius: 6px;
-      font-family: var(--mono);
-      font-size: 0.85rem;
-      min-width: 14rem;
+    input[type="url"], input[type="number"], input[type="text"], input[type="password"], textarea, select {
+      background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 0.4rem 0.6rem; border-radius: 6px; font-family: var(--mono); font-size: 0.85rem;
     }
+    input[type="url"] { min-width: 14rem; }
     input[type="number"] { min-width: 4rem; width: 4.5rem; }
-    button {
-      background: var(--accent);
-      color: #fff;
-      border: none;
-      padding: 0.45rem 0.9rem;
-      border-radius: 6px;
-      font-weight: 600;
-      cursor: pointer;
-      font-size: 0.85rem;
-    }
+    input[type="password"], input[type="text"] { min-width: 10rem; }
+    textarea { width: 100%; min-height: 4.5rem; resize: vertical; }
+    button { background: var(--accent); color: #fff; border: none; padding: 0.45rem 0.9rem; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 0.85rem; }
     button:hover { filter: brightness(1.08); }
-    button.secondary {
-      background: transparent;
-      border: 1px solid var(--border);
-      color: var(--text);
-    }
-    main {
-      padding: 1.25rem 1.5rem 2.5rem;
-      max-width: 1100px;
-      margin: 0 auto;
-    }
-    .status-bar {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 1rem;
-      margin-bottom: 1.25rem;
-      font-size: 0.85rem;
-      color: var(--muted);
-    }
+    button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    button.warn { background: #b45309; }
+    main { padding: 1.25rem 1.5rem 2.5rem; max-width: 1100px; margin: 0 auto; }
+    .status-bar { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.25rem; font-size: 0.85rem; color: var(--muted); }
     .status-bar strong { color: var(--text); }
-    .dot {
-      display: inline-block;
-      width: 0.55rem;
-      height: 0.55rem;
-      border-radius: 50%;
-      margin-right: 0.35rem;
-      vertical-align: middle;
-    }
-    .dot.ok { background: var(--ok); }
-    .dot.warn { background: var(--warn); }
-    .dot.bad { background: var(--bad); }
-    .dot.unknown { background: var(--muted); }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-      gap: 0.85rem;
-    }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 1rem 1.1rem;
-    }
-    .card h2 {
-      margin: 0 0 0.35rem;
-      font-size: 0.75rem;
-      font-weight: 500;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-    .card .value {
-      font-size: 1.65rem;
-      font-weight: 650;
-      font-variant-numeric: tabular-nums;
-      letter-spacing: -0.03em;
-    }
-    .card .sub {
-      margin-top: 0.25rem;
-      font-size: 0.8rem;
-      color: var(--muted);
-      font-family: var(--mono);
-    }
-    section {
-      margin-top: 1.75rem;
-    }
-    section > h2 {
-      margin: 0 0 0.75rem;
-      font-size: 0.95rem;
-      font-weight: 600;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 0.9rem;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      overflow: hidden;
-    }
-    th, td {
-      text-align: left;
-      padding: 0.65rem 0.9rem;
-      border-bottom: 1px solid var(--border);
-    }
+    .dot { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 50%; margin-right: 0.35rem; vertical-align: middle; }
+    .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); } .dot.unknown { background: var(--muted); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0.85rem; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.1rem; }
+    .card h2 { margin: 0 0 0.35rem; font-size: 0.75rem; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .card .value { font-size: 1.65rem; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -0.03em; }
+    .card .sub { margin-top: 0.25rem; font-size: 0.8rem; color: var(--muted); font-family: var(--mono); }
+    section { margin-top: 1.75rem; }
+    section > h2 { margin: 0 0 0.75rem; font-size: 0.95rem; font-weight: 600; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    th, td { text-align: left; padding: 0.65rem 0.9rem; border-bottom: 1px solid var(--border); vertical-align: top; }
     th { color: var(--muted); font-weight: 500; font-size: 0.75rem; text-transform: uppercase; }
     tr:last-child td { border-bottom: none; }
     td.num { font-variant-numeric: tabular-nums; font-family: var(--mono); }
-    .err {
-      background: #3f1d1d;
-      border: 1px solid #7f1d1d;
-      color: #fecaca;
-      padding: 0.75rem 1rem;
-      border-radius: 8px;
-      margin-bottom: 1rem;
-      font-size: 0.85rem;
-      white-space: pre-wrap;
-    }
-    footer {
-      margin-top: 2rem;
-      font-size: 0.75rem;
-      color: var(--muted);
-    }
+    .err { background: #3f1d1d; border: 1px solid #7f1d1d; color: #fecaca; padding: 0.75rem 1rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.85rem; white-space: pre-wrap; }
+    .okbox { background: #16321f; border: 1px solid #166534; color: #bbf7d0; padding: 0.75rem 1rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.85rem; font-family: var(--mono); white-space: pre-wrap; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.85rem; }
+    @media (max-width: 800px) { .form-grid { grid-template-columns: 1fr; } }
+    .field { display: flex; flex-direction: column; gap: 0.3rem; }
+    .field label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.85rem; }
+    .hint { font-size: 0.75rem; color: var(--muted); margin-top: 0.35rem; }
+    footer { margin-top: 2rem; font-size: 0.75rem; color: var(--muted); }
     footer a { color: var(--accent); }
+    .ok-flag { color: var(--ok); } .bad-flag { color: var(--bad); }
   </style>
 </head>
 <body>
   <header>
     <h1>AutoFix Command Centre</h1>
-    <span class="badge">Phase 7A · stats only</span>
+    <span class="badge">Phase 7B · observe + supervise</span>
     <div class="controls">
       <label for="base">Healer URL</label>
       <input id="base" type="url" value="http://localhost:8080" placeholder="http://localhost:8080" />
@@ -198,317 +79,77 @@
       <button type="button" class="secondary" id="auto">Auto: on</button>
     </div>
   </header>
-
   <main>
     <div id="error" class="err" hidden></div>
-
+    <div id="action-result" hidden></div>
     <div class="status-bar">
       <span><span id="health-dot" class="dot unknown"></span>Health: <strong id="health-text">—</strong></span>
       <span>Circuit: <strong id="circuit-text">—</strong></span>
+      <span>Paused: <strong id="paused-text">—</strong></span>
       <span>Last fetch: <strong id="last-fetch">—</strong></span>
     </div>
-
     <div class="grid" id="kpi-grid">
       <div class="card"><h2>Queue depth</h2><div class="value" id="kpi-queue">—</div></div>
       <div class="card"><h2>Discover (HTTP)</h2><div class="value" id="kpi-discover-http">—</div></div>
       <div class="card"><h2>Circuit trips</h2><div class="value" id="kpi-trips">—</div></div>
       <div class="card"><h2>Heal avg (s)</h2><div class="value" id="kpi-heal-avg">—</div><div class="sub" id="kpi-heal-n"></div></div>
     </div>
-
     <section>
       <h2>Links written (process lifetime)</h2>
-      <table>
-        <thead>
-          <tr><th>Status</th><th>Count</th></tr>
-        </thead>
-        <tbody id="links-body">
-          <tr><td colspan="2" style="color:var(--muted)">No data yet</td></tr>
-        </tbody>
-      </table>
+      <table><thead><tr><th>Status</th><th>Count</th></tr></thead>
+      <tbody id="links-body"><tr><td colspan="2" style="color:var(--muted)">No data yet</td></tr></tbody></table>
     </section>
-
     <section>
       <h2>Circuits</h2>
+      <table><thead><tr><th>Name</th><th>State</th><th>Code</th><th>Trips</th></tr></thead>
+      <tbody id="circuits-body"><tr><td colspan="4" style="color:var(--muted)">No data yet</td></tr></tbody></table>
+    </section>
+    <section>
+      <h2>Supervise (Phase 7B)</h2>
+      <div class="card">
+        <div class="form-grid">
+          <div class="field"><label for="admin-token">Admin token</label><input id="admin-token" type="password" autocomplete="off" placeholder="ADMIN_TOKEN" /></div>
+          <div class="field"><label for="actor">Actor</label><input id="actor" type="text" placeholder="ops@example.com" /></div>
+          <div class="field" style="grid-column: 1 / -1;"><label for="reason">Reason (required)</label><input id="reason" type="text" placeholder="Why this action is being taken" /></div>
+          <div class="field"><label for="urls">URLs (one per line)</label><textarea id="urls" placeholder="https://example.com/gone"></textarea></div>
+          <div class="field">
+            <label for="status">Override status</label>
+            <select id="status">
+              <option value="PENDING">PENDING</option>
+              <option value="HEALED">HEALED</option>
+              <option value="DEAD">DEAD</option>
+              <option value="HEALTHY">HEALTHY</option>
+            </select>
+            <label for="resolved" style="margin-top:0.6rem">Resolved URL (override, optional)</label>
+            <input id="resolved" type="url" placeholder="https://web.archive.org/web/…" />
+          </div>
+        </div>
+        <div class="actions">
+          <button type="button" id="act-requeue">Requeue</button>
+          <button type="button" id="act-override">Override status</button>
+          <button type="button" class="warn" id="act-reset">Reset circuit</button>
+          <button type="button" class="secondary" id="act-pause">Pause discovery</button>
+          <button type="button" class="secondary" id="act-resume">Resume</button>
+          <button type="button" class="secondary" id="act-audit">Load audit</button>
+        </div>
+        <p class="hint">Bearer token stays in this tab (sessionStorage). Actor + reason are audited. No Cloudflare credentials in the browser.</p>
+      </div>
+    </section>
+    <section>
+      <h2>Audit ring</h2>
       <table>
-        <thead>
-          <tr><th>Name</th><th>State</th><th>Code</th><th>Trips</th></tr>
-        </thead>
-        <tbody id="circuits-body">
-          <tr><td colspan="4" style="color:var(--muted)">No data yet</td></tr>
-        </tbody>
+        <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>OK</th><th>Reason / result</th></tr></thead>
+        <tbody id="audit-body"><tr><td colspan="5" style="color:var(--muted)">Load audit with a valid admin token</td></tr></tbody>
       </table>
     </section>
-
     <footer>
       Contracts:
       <a href="https://github.com/GizzZmo/autofix-polyglot/blob/main/docs/COMMAND_CENTRE.md" target="_blank" rel="noopener">COMMAND_CENTRE.md</a>
       ·
-      <a href="https://github.com/GizzZmo/autofix-polyglot/blob/main/docs/OBSERVABILITY.md" target="_blank" rel="noopener">OBSERVABILITY.md</a>
-      · Read-only (7A). No supervise actions yet.
+      <a href="https://github.com/GizzZmo/autofix-polyglot/blob/main/docs/adr/009-supervised-admin.md" target="_blank" rel="noopener">ADR-009</a>
+      · Writes: <code>POST /v1/admin/actions</code>
     </footer>
   </main>
-
-  <script>
-    const $ = (id) => document.getElementById(id);
-    const state = { auto: true, timer: null };
-
-    function baseUrl() {
-      return ($("base").value || "").replace(/\/$/, "");
-    }
-
-    function showError(msg) {
-      const el = $("error");
-      if (!msg) { el.hidden = true; el.textContent = ""; return; }
-      el.hidden = false;
-      el.textContent = msg;
-    }
-
-    /** Minimal Prometheus text parser for gauge/counter lines (no histograms buckets needed beyond _sum/_count). */
-    function parseProm(text) {
-      const metrics = {};
-      for (const line of text.split("\n")) {
-        if (!line || line.startsWith("#")) continue;
-        const m = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([0-9.eE+-]+)/);
-        if (!m) continue;
-        const name = m[1];
-        const labels = {};
-        if (m[2]) {
-          for (const part of m[2].slice(1, -1).split(",")) {
-            const kv = part.match(/([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"])*)"/);
-            if (kv) labels[kv[1]] = kv[2].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
-          }
-        }
-        const value = parseFloat(m[3]);
-        if (!metrics[name]) metrics[name] = [];
-        metrics[name].push({ labels, value });
-      }
-      return metrics;
-    }
-
-    function findMetric(metrics, name, labelFilter) {
-      const rows = metrics[name] || [];
-      if (!labelFilter) return rows;
-      return rows.filter((r) =>
-        Object.entries(labelFilter).every(([k, v]) => r.labels[k] === v)
-      );
-    }
-
-    function sumMetric(metrics, name, labelFilter) {
-      return findMetric(metrics, name, labelFilter).reduce((a, r) => a + r.value, 0);
-    }
-
-    function circuitLabel(code) {
-      if (code === 0) return "closed";
-      if (code === 1) return "half_open";
-      if (code === 2) return "open";
-      return "unknown";
-    }
-
-    async function fetchJson(path) {
-      const res = await fetch(baseUrl() + path, { cache: "no-store" });
-      if (!res.ok) throw new Error(path + " → HTTP " + res.status);
-      return res.json();
-    }
-
-    async function fetchText(path) {
-      const res = await fetch(baseUrl() + path, { cache: "no-store" });
-      if (!res.ok) throw new Error(path + " → HTTP " + res.status);
-      return res.text();
-    }
-
-    function renderHealth(health) {
-      const status = (health && health.status) || "unknown";
-      const circuit = (health && health.wayback_circuit) || "—";
-      $("health-text").textContent = status;
-      $("circuit-text").textContent = circuit;
-      const dot = $("health-dot");
-      dot.className = "dot " + (status === "ok" ? "ok" : status === "unknown" ? "unknown" : "warn");
-    }
-
-    function renderMetrics(metrics) {
-      const q = sumMetric(metrics, "autofix_queue_depth");
-      $("kpi-queue").textContent = Number.isFinite(q) ? String(Math.round(q)) : "—";
-
-      const discHttp = sumMetric(metrics, "autofix_discover_requests_total", { source: "http" });
-      $("kpi-discover-http").textContent = Number.isFinite(discHttp) ? String(Math.round(discHttp)) : "—";
-
-      const trips = sumMetric(metrics, "autofix_circuit_trips_total");
-      $("kpi-trips").textContent = Number.isFinite(trips) ? String(Math.round(trips)) : "—";
-
-      const healSum = sumMetric(metrics, "autofix_heal_duration_seconds_sum");
-      const healCount = sumMetric(metrics, "autofix_heal_duration_seconds_count");
-      if (healCount > 0) {
-        $("kpi-heal-avg").textContent = (healSum / healCount).toFixed(3);
-        $("kpi-heal-n").textContent = "n=" + Math.round(healCount);
-      } else {
-        $("kpi-heal-avg").textContent = "—";
-        $("kpi-heal-n").textContent = "";
-      }
-
-      const statuses = ["PENDING", "HEALED", "DEAD", "HEALTHY"];
-      const linksBody = $("links-body");
-      linksBody.innerHTML = statuses
-        .map((s) => {
-          const n = sumMetric(metrics, "autofix_links_total", { status: s });
-          return "<tr><td>" + s + "</td><td class=\"num\">" + (Number.isFinite(n) ? Math.round(n) : 0) + "</td></tr>";
-        })
-        .join("");
-
-      const circuitRows = findMetric(metrics, "autofix_circuit_state");
-      const tripsByName = {};
-      for (const r of findMetric(metrics, "autofix_circuit_trips_total")) {
-        tripsByName[r.labels.name || "?"] = r.value;
-      }
-      const cbody = $("circuits-body");
-      if (!circuitRows.length) {
-        cbody.innerHTML = "<tr><td colspan=\"4\" style=\"color:var(--muted)\">No circuit metrics</td></tr>";
-      } else {
-        cbody.innerHTML = circuitRows
-          .map((r) => {
-            const name = r.labels.name || "?";
-            const code = r.value;
-            const st = circuitLabel(code);
-            const t = tripsByName[name] != null ? Math.round(tripsByName[name]) : "—";
-            return (
-              "<tr><td>" +
-              name +
-              "</td><td>" +
-              st +
-              "</td><td class=\"num\">" +
-              code +
-              "</td><td class=\"num\">" +
-              t +
-              "</td></tr>"
-            );
-          })
-          .join("");
-      }
-    }
-
-    function renderAdminStats(stats) {
-      if (!stats) return;
-      $("kpi-queue").textContent =
-        stats.queue_depth != null ? String(stats.queue_depth) : "—";
-      const disc = (stats.discover_requests_total && stats.discover_requests_total.http) || 0;
-      $("kpi-discover-http").textContent = String(disc);
-
-      const circuits = stats.circuits || [];
-      let trips = 0;
-      for (const c of circuits) trips += c.trips_total || 0;
-      $("kpi-trips").textContent = String(trips);
-
-      const heal = stats.heal_duration_seconds;
-      if (heal && heal.count > 0) {
-        $("kpi-heal-avg").textContent = (heal.sum / heal.count).toFixed(3);
-        $("kpi-heal-n").textContent = "n=" + Math.round(heal.count);
-      } else {
-        $("kpi-heal-avg").textContent = "—";
-        $("kpi-heal-n").textContent = "";
-      }
-
-      const links = stats.links_written || {};
-      const statuses = ["PENDING", "HEALED", "DEAD", "HEALTHY"];
-      $("links-body").innerHTML = statuses
-        .map((s) => {
-          const n = links[s] || 0;
-          return "<tr><td>" + s + '</td><td class="num">' + n + "</td></tr>";
-        })
-        .join("");
-
-      if (!circuits.length) {
-        $("circuits-body").innerHTML =
-          '<tr><td colspan="4" style="color:var(--muted)">No circuits</td></tr>';
-      } else {
-        $("circuits-body").innerHTML = circuits
-          .map((c) => {
-            return (
-              "<tr><td>" +
-              (c.name || "?") +
-              "</td><td>" +
-              (c.state || "—") +
-              '</td><td class="num">' +
-              (c.state_code != null ? c.state_code : "—") +
-              '</td><td class="num">' +
-              (c.trips_total != null ? c.trips_total : "—") +
-              "</td></tr>"
-            );
-          })
-          .join("");
-      }
-
-      if (circuits[0] && circuits[0].state) {
-        $("circuit-text").textContent = circuits[0].state;
-      }
-      if (stats.health) {
-        $("health-text").textContent = stats.health;
-        const dot = $("health-dot");
-        dot.className =
-          "dot " + (stats.health === "ok" ? "ok" : "warn");
-      }
-    }
-
-    async function refresh() {
-      const errors = [];
-      let usedAdmin = false;
-
-      // Prefer Phase 7A JSON snapshot (no Prom parsing)
-      try {
-        const stats = await fetchJson("/v1/admin/stats");
-        renderAdminStats(stats);
-        usedAdmin = true;
-      } catch (e) {
-        errors.push(
-          "admin/stats: " + (e && e.message ? e.message : e)
-        );
-      }
-
-      if (!usedAdmin) {
-        try {
-          const health = await fetchJson("/healthz");
-          renderHealth(health);
-        } catch (e) {
-          errors.push("healthz: " + (e && e.message ? e.message : e));
-          renderHealth(null);
-        }
-        try {
-          const text = await fetchText("/metrics");
-          renderMetrics(parseProm(text));
-          errors.length = 0;
-        } catch (e) {
-          errors.push(
-            "metrics: " +
-              (e && e.message ? e.message : e) +
-              "\n(If this is CORS, ensure healer withCORS is running.)"
-          );
-        }
-      } else {
-        try {
-          const health = await fetchJson("/healthz");
-          renderHealth(health);
-        } catch (_) { /* optional */ }
-      }
-
-      $("last-fetch").textContent = new Date().toLocaleTimeString();
-      showError(errors.length ? errors.join("\n\n") : "");
-    }
-
-    function schedule() {
-      if (state.timer) clearInterval(state.timer);
-      if (!state.auto) return;
-      const sec = Math.max(3, Number($("interval").value) || 8);
-      state.timer = setInterval(refresh, sec * 1000);
-    }
-
-    $("refresh").addEventListener("click", () => refresh());
-    $("auto").addEventListener("click", () => {
-      state.auto = !state.auto;
-      $("auto").textContent = "Auto: " + (state.auto ? "on" : "off");
-      schedule();
-    });
-    $("interval").addEventListener("change", schedule);
-
-    refresh();
-    schedule();
-  </script>
+  <script src="supervise.js"></script>
 </body>
 </html>
