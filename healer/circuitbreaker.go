@@ -125,3 +125,12 @@ func (cb *CircuitBreaker) State() string {
 
 // Trips returns how many times the breaker opened.
 func (cb *CircuitBreaker) Trips() int64 { return cb.trips.Load() }
+
+// Reset forces the breaker back to closed (Phase 7B circuit.reset).
+func (cb *CircuitBreaker) Reset() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.state = stateClosed
+	cb.failures = 0
+	cb.halfOpenInFlight = 0
+}
