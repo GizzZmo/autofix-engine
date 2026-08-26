@@ -36,6 +36,7 @@ type Config struct {
 	ListenAddr      string
 	WorkerCount     int
 	UserAgent       string
+	AdminToken      string
 }
 
 func loadConfig() Config {
@@ -48,6 +49,7 @@ func loadConfig() Config {
 		ListenAddr:      envOr("HEALER_LISTEN", ":8080"),
 		WorkerCount:     4,
 		UserAgent:       "AutoFix-Healer/1.0 (+https://github.com/GizzZmo/autofix-engine)",
+		AdminToken:      os.Getenv("ADMIN_TOKEN"),
 	}
 }
 
@@ -76,9 +78,10 @@ type LinkRecord struct {
 // ---------------------------------------------------------------------------
 
 type DiscoveryQueue struct {
-	ch   chan string
-	seen map[string]struct{}
-	mu   sync.Mutex
+	ch     chan string
+	seen   map[string]struct{}
+	mu     sync.Mutex
+	paused bool
 }
 
 func NewDiscoveryQueue(buffer int) *DiscoveryQueue {
@@ -108,491 +111,26 @@ func (q *DiscoveryQueue) Depth() int64 {
 	return int64(len(q.ch))
 }
 
-// ---------------------------------------------------------------------------
-// Wayback Machine (protected by circuit breaker)
-// ---------------------------------------------------------------------------
-
-type ArchiveResponse struct {
-	ArchivedSnapshots struct {
-		Closest struct {
-			Available bool   `json:"available"`
-			URL       string `json:"url"`
-		} `json:"closest"`
-	} `json:"archived_snapshots"`
-}
-
-var waybackBreaker = NewCircuitBreaker(5, 60*time.Second, 1)
-
-func CheckArchive(ctx context.Context, client *http.Client, url string, tel *Telemetry) (string, error) {
-	ctx, span := tel.Tracer.Start(ctx, "autofix.wayback",
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(attribute.String("autofix.url", url)),
-	)
-	defer span.End()
-
-	start := time.Now()
-	outcome := "miss"
-	var result string
-
-	err := waybackBreaker.Execute(func() error {
-		apiURL := fmt.Sprintf("https://archive.org/wayback/available?url=%s", url)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-		if err != nil {
-			return err
-		}
-		req.Header.Set("User-Agent", "AutoFix-Healer/1.0")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode >= 500 {
-			return fmt.Errorf("wayback http %d", resp.StatusCode)
-		}
-
-		var res ArchiveResponse
-		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-			return err
-		}
-		if res.ArchivedSnapshots.Closest.Available && res.ArchivedSnapshots.Closest.URL != "" {
-			result = res.ArchivedSnapshots.Closest.URL
-			outcome = "hit"
-			return nil
-		}
-		return nil
-	})
-
-	dur := time.Since(start).Seconds()
-	if err != nil {
-		if err == ErrCircuitOpen {
-			outcome = "circuit_open"
-			span.SetAttributes(attribute.String("autofix.circuit.state", "open"))
-		} else {
-			outcome = "error"
-			recordSpanError(span, err)
-		}
-		tel.WaybackDuration.Record(ctx, dur, metric.WithAttributes(attribute.String("outcome", outcome)))
-		logEvent(ctx, slog.LevelWarn, "heal.archive",
-			"url", url, "error", err.Error(), "duration_ms", time.Since(start).Milliseconds(),
-			"circuit", waybackBreaker.State(), "circuit_name", "healer_wayback")
-		return "", err
-	}
-	tel.WaybackDuration.Record(ctx, dur, metric.WithAttributes(attribute.String("outcome", outcome)))
-	if result == "" {
-		err = fmt.Errorf("no archive found")
-		span.SetStatus(codes.Ok, "no archive")
-		logEvent(ctx, slog.LevelInfo, "heal.archive",
-			"url", url, "reason", "no_archive", "duration_ms", time.Since(start).Milliseconds())
-		return "", err
-	}
-	span.SetAttributes(attribute.String("autofix.resolved_url", result))
-	logEvent(ctx, slog.LevelInfo, "heal.archive",
-		"url", url, "resolved_url", result, "duration_ms", time.Since(start).Milliseconds())
-	return result, nil
-}
-
-// ---------------------------------------------------------------------------
-// Soft-404 heuristics
-// ---------------------------------------------------------------------------
-
-var (
-	soft404TitleRe = regexp.MustCompile(`(?i)(404|not\s+found|page\s+(not\s+found|does\s+not\s+exist|missing)|error\s*404|page\s+moved|gone)`)
-	soft404BodyRe  = regexp.MustCompile(`(?i)(404\s*(not\s+found|error)|this\s+page\s+(could\s+not\s+be\s+found|does\s+not\s+exist)|the\s+requested\s+url\s+was\s+not\s+found)`)
-)
-
-func looksLikeSoft404(body []byte, contentType string) bool {
-	if !strings.Contains(strings.ToLower(contentType), "text/html") {
-		return false
-	}
-	text := string(body)
-	if start := strings.Index(strings.ToLower(text), "<title"); start >= 0 {
-		if gt := strings.Index(text[start:], ">"); gt >= 0 {
-			end := strings.Index(strings.ToLower(text[start+gt:]), "</title>")
-			if end >= 0 {
-				title := text[start+gt+1 : start+gt+end]
-				if soft404TitleRe.MatchString(title) {
-					return true
-				}
-			}
-		}
-	}
-	snippet := text
-	if len(snippet) > 8192 {
-		snippet = snippet[:8192]
-	}
-	return soft404BodyRe.MatchString(snippet)
-}
-
-func CheckLink(ctx context.Context, client *http.Client, url string, tel *Telemetry) (bool, string) {
-	ctx, span := tel.Tracer.Start(ctx, "autofix.check",
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(attribute.String("autofix.url", url)),
-	)
-	defer span.End()
-
-	start := time.Now()
-	outcome := "alive"
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
-	if err != nil {
-		tel.CheckDuration.Record(ctx, time.Since(start).Seconds(),
-			metric.WithAttributes(attribute.String("outcome", "error")))
-		recordSpanError(span, err)
-		logEvent(ctx, slog.LevelInfo, "heal.check", "url", url, "reason", "invalid_url", "duration_ms", time.Since(start).Milliseconds())
-		return true, "invalid_url"
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; AutoFix-Healer/1.0)")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		tel.CheckDuration.Record(ctx, time.Since(start).Seconds(),
-			metric.WithAttributes(attribute.String("outcome", "error")))
-		recordSpanError(span, err)
-		logEvent(ctx, slog.LevelInfo, "heal.check", "url", url, "reason", "network_error", "duration_ms", time.Since(start).Milliseconds())
-		return true, "network_error"
-	}
-	defer resp.Body.Close()
-
-	switch {
-	case resp.StatusCode >= 200 && resp.StatusCode < 400:
-		// soft-404 check on GET for HTML
-		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") || resp.StatusCode == 200 {
-			getReq, gerr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-			if gerr == nil {
-				getReq.Header.Set("User-Agent", "Mozilla/5.0 (compatible; AutoFix-Healer/1.0)")
-				getResp, gerr2 := client.Do(getReq)
-				if gerr2 == nil {
-					defer getResp.Body.Close()
-					body, _ := io.ReadAll(io.LimitReader(getResp.Body, 64*1024))
-					if looksLikeSoft404(body, getResp.Header.Get("Content-Type")) {
-						outcome = "soft404"
-						tel.CheckDuration.Record(ctx, time.Since(start).Seconds(),
-							metric.WithAttributes(attribute.String("outcome", outcome)))
-						span.SetAttributes(attribute.String("autofix.check_outcome", outcome))
-						logEvent(ctx, slog.LevelInfo, "heal.check", "url", url, "reason", "soft404", "duration_ms", time.Since(start).Milliseconds())
-						return true, "soft404"
-					}
-				}
-			}
-		}
-		tel.CheckDuration.Record(ctx, time.Since(start).Seconds(),
-			metric.WithAttributes(attribute.String("outcome", outcome)))
-		span.SetAttributes(attribute.String("autofix.check_outcome", outcome))
-		logEvent(ctx, slog.LevelInfo, "heal.check", "url", url, "status_code", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds())
-		return false, ""
-	case resp.StatusCode == 404 || resp.StatusCode == 410:
-		outcome = "dead"
-		tel.CheckDuration.Record(ctx, time.Since(start).Seconds(),
-			metric.WithAttributes(attribute.String("outcome", outcome)))
-		span.SetAttributes(attribute.String("autofix.check_outcome", outcome), attribute.Int("http.status_code", resp.StatusCode))
-		logEvent(ctx, slog.LevelInfo, "heal.check", "url", url, "status_code", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds())
-		return true, fmt.Sprintf("http_%d", resp.StatusCode)
+func (q *DiscoveryQueue) EnqueueForce(url string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	delete(q.seen, url)
+	q.seen[url] = struct{}{}
+	select {
+	case q.ch <- url:
 	default:
-		outcome = "other"
-		tel.CheckDuration.Record(ctx, time.Since(start).Seconds(),
-			metric.WithAttributes(attribute.String("outcome", outcome)))
-		span.SetAttributes(attribute.String("autofix.check_outcome", outcome), attribute.Int("http.status_code", resp.StatusCode))
-		logEvent(ctx, slog.LevelInfo, "heal.check", "url", url, "status_code", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds())
-		return true, fmt.Sprintf("http_%d", resp.StatusCode)
+		slog.Warn("queue full, dropping", "event", "heal.defer", "component", "healer", "url", url)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Cloudflare KV
-// ---------------------------------------------------------------------------
-
-type CloudflareKV struct {
-	AccountID   string
-	NamespaceID string
-	Token       string
-	Client      *http.Client
+func (q *DiscoveryQueue) SetPaused(p bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.paused = p
 }
 
-func keyFor(url string) string {
-	return base64.StdEncoding.EncodeToString([]byte(url))
-}
-
-func (kv *CloudflareKV) Put(ctx context.Context, key string, rec LinkRecord) error {
-	if kv.AccountID == "" || kv.Token == "" || kv.NamespaceID == "" {
-		return nil
-	}
-	body, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	apiURL := fmt.Sprintf(
-		"https://api.cloudflare.com/client/v4/accounts/%s/storage/kv/namespaces/%s/values/%s",
-		kv.AccountID, kv.NamespaceID, key,
-	)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, apiURL, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+kv.Token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := kv.Client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("kv put %d: %s", resp.StatusCode, string(b))
-	}
-	return nil
-}
-
-// ---------------------------------------------------------------------------
-// Worker
-// ---------------------------------------------------------------------------
-
-func runWorker(id int, q *DiscoveryQueue, kv *CloudflareKV, client *http.Client, wg *sync.WaitGroup, tel *Telemetry) {
-	defer wg.Done()
-	for url := range q.Chan() {
-		healOne(context.Background(), url, kv, client, tel)
-	}
-}
-
-func healOne(ctx context.Context, url string, kv *CloudflareKV, client *http.Client, tel *Telemetry) {
-	ctx, span := tel.Tracer.Start(ctx, "autofix.heal",
-		trace.WithSpanKind(trace.SpanKindInternal),
-		trace.WithAttributes(attribute.String("autofix.url", url)),
-	)
-	defer span.End()
-
-	start := time.Now()
-	result := "unknown"
-
-	dead, reason := CheckLink(ctx, client, url, tel)
-	if !dead {
-		result = "healthy"
-		_ = kv.Put(ctx, keyFor(url), LinkRecord{
-			Status:      "HEALTHY",
-			OriginalURL: url,
-			HealedAt:    time.Now().UTC().Format(time.RFC3339),
-		})
-		tel.RecordLink(ctx, "HEALTHY")
-		tel.RecordHeal(ctx, time.Since(start).Seconds(), result)
-		span.SetAttributes(attribute.String("autofix.status", "HEALTHY"))
-		logEvent(ctx, slog.LevelInfo, "heal.write",
-			"url", url, "status", "HEALTHY", "duration_ms", time.Since(start).Milliseconds())
-		return
-	}
-
-	healed, err := CheckArchive(ctx, client, url, tel)
-	if err != nil {
-		if err == ErrCircuitOpen {
-			result = "deferred"
-			_ = kv.Put(ctx, keyFor(url), LinkRecord{
-				Status:      "PENDING",
-				OriginalURL: url,
-				HealedAt:    time.Now().UTC().Format(time.RFC3339),
-				Reason:      "circuit_open",
-			})
-			tel.RecordLink(ctx, "PENDING")
-			tel.RecordHeal(ctx, time.Since(start).Seconds(), result)
-			span.SetAttributes(
-				attribute.String("autofix.status", "PENDING"),
-				attribute.String("autofix.reason", "circuit_open"),
-				attribute.String("autofix.circuit.name", "healer_wayback"),
-				attribute.String("autofix.circuit.state", "open"),
-			)
-			logEvent(ctx, slog.LevelWarn, "heal.defer",
-				"url", url, "reason", "circuit_open", "circuit_name", "healer_wayback",
-				"duration_ms", time.Since(start).Milliseconds())
-			return
-		}
-		result = "dead"
-		_ = kv.Put(ctx, keyFor(url), LinkRecord{
-			Status:      "DEAD",
-			OriginalURL: url,
-			HealedAt:    time.Now().UTC().Format(time.RFC3339),
-			Reason:      reason,
-		})
-		tel.RecordLink(ctx, "DEAD")
-		tel.RecordHeal(ctx, time.Since(start).Seconds(), result)
-		span.SetAttributes(attribute.String("autofix.status", "DEAD"), attribute.String("autofix.reason", reason))
-		logEvent(ctx, slog.LevelInfo, "heal.write",
-			"url", url, "status", "DEAD", "reason", reason, "duration_ms", time.Since(start).Milliseconds())
-		return
-	}
-
-	result = "healed"
-	err = kv.Put(ctx, keyFor(url), LinkRecord{
-		Status:      "HEALED",
-		OriginalURL: url,
-		ResolvedURL: healed,
-		HealedAt:    time.Now().UTC().Format(time.RFC3339),
-		Reason:      reason,
-	})
-	tel.RecordLink(ctx, "HEALED")
-	tel.RecordHeal(ctx, time.Since(start).Seconds(), result)
-	span.SetAttributes(
-		attribute.String("autofix.status", "HEALED"),
-		attribute.String("autofix.reason", reason),
-	)
-	if err != nil {
-		recordSpanError(span, err)
-		logEvent(ctx, slog.LevelError, "heal.write",
-			"url", url, "status", "HEALED", "error", err.Error(), "duration_ms", time.Since(start).Milliseconds())
-		return
-	}
-	logEvent(ctx, slog.LevelInfo, "heal.write",
-		"url", url, "status", "HEALED", "reason", reason, "resolved_url", healed,
-		"duration_ms", time.Since(start).Milliseconds())
-}
-
-// ---------------------------------------------------------------------------
-// HTTP API
-// ---------------------------------------------------------------------------
-
-type discoverRequest struct {
-	URLs []string `json:"urls"`
-	URL  string   `json:"url"`
-}
-
-func withCORS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, traceparent, tracestate")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func startHTTPServer(addr string, q *DiscoveryQueue, tel *Telemetry) *http.Server {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"status":          "ok",
-			"wayback_circuit": waybackBreaker.State(),
-		})
-	})
-
-	mux.Handle("/metrics", tel.PromHandler())
-
-	// Phase 7A — JSON snapshot for command-centre (polyglot admin-stats-response)
-	mux.HandleFunc("/v1/admin/stats", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "GET only", http.StatusMethodNotAllowed)
-			return
-		}
-		stats := tel.Snapshot(q.Depth(), "healer_wayback", waybackBreaker.State(), 0)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(stats)
-	})
-
-	mux.Handle("/v1/discover", otelhttp.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		ctx, span := tel.Tracer.Start(ctx, "autofix.discover",
-			trace.WithSpanKind(trace.SpanKindServer),
-		)
-		defer span.End()
-
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		var req discoverRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			recordSpanError(span, err)
-			http.Error(w, "invalid json", http.StatusBadRequest)
-			return
-		}
-		count := 0
-		for _, u := range req.URLs {
-			if u != "" {
-				q.Enqueue(u)
-				count++
-			}
-		}
-		if req.URL != "" {
-			q.Enqueue(req.URL)
-			count++
-		}
-		tel.RecordDiscoverHTTP(ctx)
-		span.SetAttributes(attribute.Int("autofix.enqueued", count))
-		logEvent(ctx, slog.LevelInfo, "queue.consume", "count", count, "source", "http")
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"enqueued": count})
-	}), "autofix.discover.http"))
-
-	srv := &http.Server{Addr: addr, Handler: withCORS(mux)}
-	go func() {
-		slog.Info("discovery API listening", "event", "startup", "component", "healer", "addr", addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("http server error", "error", err.Error())
-			os.Exit(1)
-		}
-	}()
-	return srv
-}
-
-func main() {
-	setupSlog()
-	cfg := loadConfig()
-	slog.Info("AutoFix Healer Engine starting", "event", "startup", "component", "healer")
-
-	if cfg.CFAccountID == "" || cfg.CFAPIToken == "" || cfg.CFKVNamespaceID == "" {
-		slog.Warn("Cloudflare credentials missing — healed links will NOT be written to KV",
-			"event", "startup", "component", "healer")
-	}
-
-	q := NewDiscoveryQueue(10_000)
-
-	ctx := context.Background()
-	tel, err := InitTelemetry(ctx, q.Depth, func() int64 {
-		return circuitStateValue(waybackBreaker.State())
-	})
-	if err != nil {
-		slog.Error("telemetry init failed", "error", err.Error())
-		os.Exit(1)
-	}
-	waybackBreaker.onTrip = func() {
-		tel.CircuitTrips.Add(context.Background(), 1,
-			metric.WithAttributes(attribute.String("name", "healer_wayback")))
-		logEvent(context.Background(), slog.LevelWarn, "circuit.open",
-			"circuit_name", "healer_wayback", "circuit", "open")
-	}
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	kv := &CloudflareKV{
-		AccountID:   cfg.CFAccountID,
-		NamespaceID: cfg.CFKVNamespaceID,
-		Token:       cfg.CFAPIToken,
-		Client:      client,
-	}
-
-	q.Enqueue("https://dead-example.com/missing-page")
-	q.Enqueue("https://httpstat.us/404")
-
-	var wg sync.WaitGroup
-	for i := 0; i < cfg.WorkerCount; i++ {
-		wg.Add(1)
-		go runWorker(i, q, kv, client, &wg, tel)
-	}
-
-	srv := startHTTPServer(cfg.ListenAddr, q, tel)
-
-	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	<-sigCtx.Done()
-	stop()
-
-	slog.Info("shutting down", "event", "shutdown", "component", "healer")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
-	tel.Shutdown(shutdownCtx)
-	close(q.ch)
-	wg.Wait()
-	slog.Info("healer stopped", "event", "shutdown", "component", "healer")
+func (q *DiscoveryQueue) Paused() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.paused
 }
