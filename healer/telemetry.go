@@ -45,6 +45,7 @@ type Telemetry struct {
 	CircuitTrips    metric.Int64Counter
 	DiscoverReqs    metric.Int64Counter
 	LinksTotal      metric.Int64Counter
+	AdminActions    metric.Int64Counter
 	QueueDepth      metric.Int64ObservableGauge
 
 	promHandler http.Handler
@@ -87,7 +88,6 @@ func InitTelemetry(ctx context.Context, queueDepthFn func() int64, circuitStateF
 	var spanExporters []sdktrace.SpanExporter
 	if ep := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")); ep != "" {
 		opts := []otlptracehttp.Option{}
-		// endpoint may be host:port or full URL; otlptracehttp accepts WithEndpoint / WithEndpointURL
 		if strings.HasPrefix(ep, "http://") || strings.HasPrefix(ep, "https://") {
 			opts = append(opts, otlptracehttp.WithEndpointURL(ep))
 		} else {
@@ -195,6 +195,13 @@ func InitTelemetry(ctx context.Context, queueDepthFn func() int64, circuitStateF
 	if err != nil {
 		return nil, err
 	}
+	t.AdminActions, err = t.Meter.Int64Counter(
+		"autofix_admin_actions_total",
+		metric.WithDescription("Supervised admin writes"),
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	t.CircuitState, err = t.Meter.Int64ObservableGauge(
 		"autofix_circuit_state",
@@ -243,7 +250,6 @@ func (t *Telemetry) PromHandler() http.Handler {
 	}
 	return t.promHandler
 }
-
 
 // RecordLink bumps process counters + OTel counter for a KV write status.
 func (t *Telemetry) RecordLink(ctx context.Context, status string) {
@@ -331,10 +337,10 @@ func (t *Telemetry) Snapshot(queueDepth int64, circuitName, circuitState string,
 	var discover map[string]int64
 	if t != nil {
 		links = map[string]int64{
-			"PENDING":  t.linkPending.Load(),
-			"HEALED":   t.linkHealed.Load(),
-			"DEAD":     t.linkDead.Load(),
-			"HEALTHY":  t.linkHealthy.Load(),
+			"PENDING": t.linkPending.Load(),
+			"HEALED":  t.linkHealed.Load(),
+			"DEAD":    t.linkDead.Load(),
+			"HEALTHY": t.linkHealthy.Load(),
 		}
 		discover = map[string]int64{
 			"http":  t.discoverHTTP.Load(),
@@ -342,9 +348,9 @@ func (t *Telemetry) Snapshot(queueDepth int64, circuitName, circuitState string,
 		}
 	}
 	return AdminStats{
-		Service:               "autofix-healer",
-		Ts:                    time.Now().UTC().Format(time.RFC3339),
-		Health:                "ok",
+		Service: "autofix-healer",
+		Ts:      time.Now().UTC().Format(time.RFC3339),
+		Health:  "ok",
 		Circuits: []AdminCircuit{{
 			Name:       circuitName,
 			State:      circuitState,
@@ -358,7 +364,6 @@ func (t *Telemetry) Snapshot(queueDepth int64, circuitName, circuitState string,
 	}
 }
 
-// slogJSON configures JSON structured logging (polyglot log fields).
 func setupSlog() {
 	h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
 	slog.SetDefault(slog.New(h))
