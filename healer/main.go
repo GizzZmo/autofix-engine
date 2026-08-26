@@ -168,8 +168,8 @@ func startHTTPServer(addr string, q *DiscoveryQueue, kv *CloudflareKV, tel *Tele
 	})
 	mux.Handle("/metrics", tel.PrometheusHandler())
 	mux.HandleFunc("GET /v1/admin/stats", func(w http.ResponseWriter, r *http.Request) {
-		stats := tel.Snapshot(q.Depth(), "healer_wayback", waybackBreaker.State(), 0)
-		stats["paused"] = q.Paused()
+		// Snapshot matches polyglot admin-stats-response (no extra fields).
+		stats := tel.Snapshot(q.Depth(), "healer_wayback", waybackBreaker.State(), waybackBreaker.Trips())
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(stats)
 	})
@@ -241,7 +241,10 @@ func main() {
 			"circuit_name", "healer_wayback", "circuit", "open")
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
+	}
 	kv := &CloudflareKV{
 		AccountID:   cfg.CFAccountID,
 		NamespaceID: cfg.CFKVNamespaceID,
