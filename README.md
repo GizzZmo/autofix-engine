@@ -13,9 +13,9 @@
 
 AutoFix eliminates 404s and broken external links without requiring database migrations.
 
-**Deploy guide → [DEPLOY.md](./DEPLOY.md)** · **Makefile** · **docker-compose.yml**  
+**Blueprint → [BLUEPRINT.md](./BLUEPRINT.md)** · **Deploy guide → [DEPLOY.md](./DEPLOY.md)** · **Makefile** · **docker-compose.yml**  
 **Contracts → [autofix-polyglot](https://github.com/GizzZmo/autofix-polyglot)** (schemas, observability, versioning, command centre)  
-**Ops UI → [command-centre/](./command-centre/)** (Phase 7A stats against `/metrics` + `/healthz`)
+**Ops UI → [command-centre/](./command-centre/)** (observe + supervise against `/metrics`, `/healthz`, `/v1/admin/*`)
 
 ### How it works
 1. **Intercept** — Edge Worker parses HTML via `HTMLRewriter`.
@@ -41,7 +41,7 @@ Normative field/metric names: [polyglot OBSERVABILITY.md](https://github.com/Giz
 |-------|------|
 | **Healer** | `healer/telemetry.go` — Prometheus **`GET /metrics`**, optional **OTLP** traces+metrics |
 | **Edge** | `edge-worker/src/telemetry.ts` — structured JSON logs + W3C **`traceparent`** on healer calls |
-| **Command centre** | `command-centre/` — human stats UI (read-only) |
+| **Command centre** | `command-centre/` — human stats + supervise UI |
 
 ### Healer metrics (Prometheus)
 
@@ -58,7 +58,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 
 `service.name` = `autofix-healer`. Span names: `autofix.heal`, `autofix.check`, `autofix.wayback`, `autofix.discover` — wired in `main.go` and edge `index.ts`.
 
-### Command centre (stats)
+### Command centre
 
 ```bash
 # terminal 1
@@ -68,7 +68,7 @@ cd command-centre && python3 -m http.server 8090
 # open http://localhost:8090 — set Healer URL to http://localhost:8080
 ```
 
-Contracts: [COMMAND_CENTRE.md](https://github.com/GizzZmo/autofix-polyglot/blob/main/docs/COMMAND_CENTRE.md). No write/supervise actions yet (Phase 7B).
+Contracts: [COMMAND_CENTRE.md](https://github.com/GizzZmo/autofix-polyglot/blob/main/docs/COMMAND_CENTRE.md).
 
 ---
 
@@ -86,7 +86,7 @@ Contracts: [COMMAND_CENTRE.md](https://github.com/GizzZmo/autofix-polyglot/blob/
 |-----------|------|
 | `edge-worker/` | HTML stream rewrite, KV lookup, queue producer, edge circuit breaker |
 | `healer/` | Discovery, soft-404, Wayback, KV write, OTel metrics/traces |
-| `command-centre/` | Ops stats UI (Phase 7A) |
+| `command-centre/` | Ops stats + supervise UI |
 | `client/` | Optional browser runtime |
 | `scripts/` | KV/queue setup, lockfile expand, KV id guard |
 
@@ -145,9 +145,10 @@ Local full stack: `./scripts/dev.sh` (healer + `wrangler dev`).
 
 ```
 autofix-engine/
+├── BLUEPRINT.md           # agent / contributor guide
 ├── edge-worker/          # Worker + telemetry.ts
 ├── healer/               # Go healer + telemetry.go + circuit breaker
-├── command-centre/       # Phase 7A stats UI
+├── command-centre/       # observe + supervise UI
 ├── client/autofix.js
 ├── scripts/
 ├── docker-compose.yml
