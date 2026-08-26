@@ -385,29 +385,107 @@
       }
     }
 
-    async function refresh() {
-      const errors = [];
-      let health = null;
-      let metrics = null;
+    function renderAdminStats(stats) {
+      if (!stats) return;
+      $("kpi-queue").textContent =
+        stats.queue_depth != null ? String(stats.queue_depth) : "—";
+      const disc = (stats.discover_requests_total && stats.discover_requests_total.http) || 0;
+      $("kpi-discover-http").textContent = String(disc);
 
-      try {
-        health = await fetchJson("/healthz");
-        renderHealth(health);
-      } catch (e) {
-        errors.push("healthz: " + (e && e.message ? e.message : e));
-        renderHealth(null);
+      const circuits = stats.circuits || [];
+      let trips = 0;
+      for (const c of circuits) trips += c.trips_total || 0;
+      $("kpi-trips").textContent = String(trips);
+
+      const heal = stats.heal_duration_seconds;
+      if (heal && heal.count > 0) {
+        $("kpi-heal-avg").textContent = (heal.sum / heal.count).toFixed(3);
+        $("kpi-heal-n").textContent = "n=" + Math.round(heal.count);
+      } else {
+        $("kpi-heal-avg").textContent = "—";
+        $("kpi-heal-n").textContent = "";
       }
 
+      const links = stats.links_written || {};
+      const statuses = ["PENDING", "HEALED", "DEAD", "HEALTHY"];
+      $("links-body").innerHTML = statuses
+        .map((s) => {
+          const n = links[s] || 0;
+          return "<tr><td>" + s + '</td><td class="num">' + n + "</td></tr>";
+        })
+        .join("");
+
+      if (!circuits.length) {
+        $("circuits-body").innerHTML =
+          '<tr><td colspan="4" style="color:var(--muted)">No circuits</td></tr>';
+      } else {
+        $("circuits-body").innerHTML = circuits
+          .map((c) => {
+            return (
+              "<tr><td>" +
+              (c.name || "?") +
+              "</td><td>" +
+              (c.state || "—") +
+              '</td><td class="num">' +
+              (c.state_code != null ? c.state_code : "—") +
+              '</td><td class="num">' +
+              (c.trips_total != null ? c.trips_total : "—") +
+              "</td></tr>"
+            );
+          })
+          .join("");
+      }
+
+      if (circuits[0] && circuits[0].state) {
+        $("circuit-text").textContent = circuits[0].state;
+      }
+      if (stats.health) {
+        $("health-text").textContent = stats.health;
+        const dot = $("health-dot");
+        dot.className =
+          "dot " + (stats.health === "ok" ? "ok" : "warn");
+      }
+    }
+
+    async function refresh() {
+      const errors = [];
+      let usedAdmin = false;
+
+      // Prefer Phase 7A JSON snapshot (no Prom parsing)
       try {
-        const text = await fetchText("/metrics");
-        metrics = parseProm(text);
-        renderMetrics(metrics);
+        const stats = await fetchJson("/v1/admin/stats");
+        renderAdminStats(stats);
+        usedAdmin = true;
       } catch (e) {
         errors.push(
-          "metrics: " +
-            (e && e.message ? e.message : e) +
-            "\n(If this is CORS, serve the UI same-origin or allow Origin on the healer.)"
+          "admin/stats: " + (e && e.message ? e.message : e)
         );
+      }
+
+      if (!usedAdmin) {
+        try {
+          const health = await fetchJson("/healthz");
+          renderHealth(health);
+        } catch (e) {
+          errors.push("healthz: " + (e && e.message ? e.message : e));
+          renderHealth(null);
+        }
+        try {
+          const text = await fetchText("/metrics");
+          renderMetrics(parseProm(text));
+          errors.length = 0;
+        } catch (e) {
+          errors.push(
+            "metrics: " +
+              (e && e.message ? e.message : e) +
+              "\n(If this is CORS, ensure healer withCORS is running.)"
+          );
+        }
+      } else {
+        try {
+          const health = await fetchJson("/healthz");
+          renderHealth(health);
+        } catch (_) { /* optional */ }
       }
 
       $("last-fetch").textContent = new Date().toLocaleTimeString();

@@ -7,12 +7,12 @@ Minimal **observe** UI for the Go healer. Contracts:
 
 | Panel | Source |
 |-------|--------|
-| Health + Wayback circuit | `GET /healthz` |
-| Queue depth | `autofix_queue_depth` |
-| Discover requests | `autofix_discover_requests_total` |
-| Links written by status | `autofix_links_total` |
-| Circuit state / trips | `autofix_circuit_state`, `autofix_circuit_trips_total` |
-| Heal latency (avg) | `autofix_heal_duration_seconds` count/sum |
+| Health + Wayback circuit | `GET /healthz` (fallback) or `GET /v1/admin/stats` |
+| Queue depth | admin stats / `autofix_queue_depth` |
+| Discover requests | admin stats / `autofix_discover_requests_total` |
+| Links written by status | admin stats / `autofix_links_total` |
+| Circuit state / trips | admin stats / Prometheus circuit metrics |
+| Heal latency (avg) | admin stats / histogram count+sum |
 
 **No write actions** in 7A (no override, no circuit reset).
 
@@ -35,22 +35,13 @@ python3 -m http.server 8090
 
 3. Set **Healer base URL** to `http://localhost:8080` and click **Refresh**.
 
+The UI **prefers** `GET /v1/admin/stats` (JSON). If that fails, it falls back to parsing `GET /metrics` Prometheus text.
+
 ### CORS
 
-Browsers block cross-origin fetches unless the healer sends CORS headers.
-For local dev either:
+The healer enables `Access-Control-Allow-Origin: *` on all routes via `withCORS` middleware (local/dev). For production, terminate CORS at a reverse proxy and restrict origins.
 
-- Serve the UI from the same origin as the healer later, or
-- Open Chrome with disabled web security (dev only), or
-- Add CORS middleware on the healer (follow-up).
+### Security
 
-If `/metrics` is blocked, the UI shows the error and still tries `/healthz`.
-
-## Optional: JSON stats
-
-When the healer implements `GET /v1/admin/stats` (schema in polyglot), the UI can prefer that over Prometheus parsing. Not required for 7A.
-
-## Security
-
-- Do **not** expose `/metrics` or this UI on the public internet without auth.
+- Do **not** expose `/metrics`, `/v1/admin/stats`, or this UI on the public internet without auth.
 - Never put Cloudflare API tokens in the browser.
