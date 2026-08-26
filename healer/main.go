@@ -1,28 +1,11 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"encoding/base64"
-	"encoding/json"
-	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"os"
-	"os/signal"
-	"regexp"
-	"strings"
 	"sync"
-	"syscall"
-	"time"
 
 	"github.com/joho/godotenv"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // ---------------------------------------------------------------------------
