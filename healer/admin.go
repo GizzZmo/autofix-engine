@@ -120,7 +120,9 @@ func registerAdminRoutes(mux *http.ServeMux, q *DiscoveryQueue, kv *CloudflareKV
 
 	mux.HandleFunc("POST /v1/admin/actions", requireAdminToken(adminToken, func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		ctx, span := tel.Tracer.Start(ctx, "autofix.admin", trace.WithSpanKind(trace.SpanKindServer))
+		ctx, span := tel.Tracer.Start(ctx, "autofix.admin",
+			trace.WithSpanKind(trace.SpanKindServer),
+		)
 		defer span.End()
 
 		var req AdminActionRequest
@@ -129,24 +131,44 @@ func registerAdminRoutes(mux *http.ServeMux, q *DiscoveryQueue, kv *CloudflareKV
 			return
 		}
 		ts := time.Now().UTC().Format(time.RFC3339)
-		ev := AdminAuditEvent{AuditID: newAuditID(), Ts: ts, Actor: req.Actor, Action: req.Action, Reason: req.Reason, URLs: req.URLs, CircuitName: req.CircuitName}
+		ev := AdminAuditEvent{
+			AuditID:     newAuditID(),
+			Ts:          ts,
+			Actor:       req.Actor,
+			Action:      req.Action,
+			Reason:      req.Reason,
+			URLs:        req.URLs,
+			CircuitName: req.CircuitName,
+		}
 		if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
 			ev.TraceID = sc.TraceID().String()
 		}
+
 		resp := AdminActionResponse{Action: req.Action, AuditID: ev.AuditID, Ts: ts}
+
 		if req.Actor == "" || req.Reason == "" || req.Action == "" {
+			ev.OK = false
 			ev.Error = "actor, action, and reason are required"
 			resp.Error = ev.Error
 			audit.Append(ev)
 			recordAdminMetric(ctx, tel, req.Action, false)
+			logEvent(ctx, slog.LevelWarn, "admin.action",
+				"actor", req.Actor, "action", req.Action, "audit_id", ev.AuditID, "ok", false, "error", ev.Error)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(resp)
 			return
 		}
+
+		span.SetAttributes(
+			attribute.String("autofix.admin.action", req.Action),
+			attribute.String("autofix.admin.actor", req.Actor),
+		)
+
 		switch req.Action {
 		case "link.requeue":
 			if len(req.URLs) == 0 {
+				ev.OK = false
 				ev.Error = "urls required"
 			} else {
 				n := 0
@@ -164,8 +186,10 @@ func registerAdminRoutes(mux *http.ServeMux, q *DiscoveryQueue, kv *CloudflareKV
 			}
 		case "link.override":
 			if kv == nil {
+				ev.OK = false
 				ev.Error = "kv client unavailable"
 			} else if len(req.URLs) == 0 || req.Status == "" {
+				ev.OK = false
 				ev.Error = "urls and status required"
 			} else {
 				written := 0
@@ -173,8 +197,15 @@ func registerAdminRoutes(mux *http.ServeMux, q *DiscoveryQueue, kv *CloudflareKV
 					if u == "" {
 						continue
 					}
-					rec := LinkRecord{Status: req.Status, OriginalURL: u, ResolvedURL: req.ResolvedURL, HealedAt: ts, Reason: "admin_override:" + req.Reason}
+					rec := LinkRecord{
+						Status:      req.Status,
+						OriginalURL: u,
+						ResolvedURL: req.ResolvedURL,
+						HealedAt:    ts,
+						Reason:      "admin_override:" + req.Reason,
+					}
 					if err := kv.Put(ctx, keyFor(u), rec); err != nil {
+						ev.OK = false
 						ev.Error = err.Error()
 						break
 					}
@@ -190,6 +221,7 @@ func registerAdminRoutes(mux *http.ServeMux, q *DiscoveryQueue, kv *CloudflareKV
 			}
 		case "circuit.reset":
 			if req.CircuitName != "" && req.CircuitName != "healer_wayback" {
+				ev.OK = false
 				ev.Error = "unknown circuit_name"
 			} else {
 				before := waybackBreaker.State()
@@ -213,14 +245,23 @@ func registerAdminRoutes(mux *http.ServeMux, q *DiscoveryQueue, kv *CloudflareKV
 			resp.Result = map[string]any{"paused": false}
 			ev.After = resp.Result
 		default:
+			ev.OK = false
 			ev.Error = "unknown action"
 		}
+
 		if ev.Error != "" {
 			resp.Error = ev.Error
 		}
 		audit.Append(ev)
 		recordAdminMetric(ctx, tel, req.Action, ev.OK)
-		logEvent(ctx, slog.LevelInfo, "admin.action", "actor", req.Actor, "action", req.Action, "audit_id", ev.AuditID, "ok", ev.OK, "reason", req.Reason)
+		lvl := slog.LevelInfo
+		if !ev.OK {
+			lvl = slog.LevelWarn
+		}
+		logEvent(ctx, lvl, "admin.action",
+			"actor", req.Actor, "action", req.Action, "audit_id", ev.AuditID,
+			"ok", ev.OK, "reason", req.Reason)
+
 		code := http.StatusOK
 		if !ev.OK {
 			code = http.StatusBadRequest
